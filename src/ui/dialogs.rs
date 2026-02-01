@@ -13,7 +13,7 @@ use ratatui::{
 use crate::services::file_ops::FileOperationType;
 
 use super::{
-    app::{App, ConflictResolution, ConflictState, Dialog, DialogType, PathCompletion},
+    app::{App, ConflictResolution, ConflictState, Dialog, DialogType, PathCompletion, SettingsState},
     theme::Theme,
 };
 
@@ -251,7 +251,8 @@ pub fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, th
     const COPY_MOVE_BASE_HEIGHT: u16 = 7;     // Copy/Move 다이얼로그 기본 높이
     const SIMPLE_INPUT_HEIGHT: u16 = 5;       // 간단한 입력 다이얼로그 높이
     const CONFIRM_DIALOG_HEIGHT: u16 = 6;     // 확인 다이얼로그 높이
-    const PROGRESS_DIALOG_HEIGHT: u16 = 10;   // 프로그레스 다이얼로그 높이
+    const PROGRESS_DIALOG_HEIGHT: u16 = 8;    // 프로그레스 다이얼로그 높이
+    const CONFLICT_DIALOG_HEIGHT: u16 = 9;    // 충돌 다이얼로그 높이 (버튼 2줄)
 
     // 자동완성 목록 현재 높이 계산
     let completion_height = if let Some(ref completion) = dialog.completion {
@@ -282,14 +283,20 @@ pub fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, th
             let h = GOTO_BASE_HEIGHT + completion_height;
             (w, h, max_h)
         }
-        DialogType::Search | DialogType::Mkdir | DialogType::Rename => {
+        DialogType::Search | DialogType::Mkdir | DialogType::Rename | DialogType::Tar => {
             (SIMPLE_DIALOG_WIDTH, SIMPLE_INPUT_HEIGHT, SIMPLE_INPUT_HEIGHT)
         }
         DialogType::Progress => {
             (SIMPLE_DIALOG_WIDTH, PROGRESS_DIALOG_HEIGHT, PROGRESS_DIALOG_HEIGHT)
         }
         DialogType::DuplicateConflict => {
-            (SIMPLE_DIALOG_WIDTH, PROGRESS_DIALOG_HEIGHT, PROGRESS_DIALOG_HEIGHT)
+            (SIMPLE_DIALOG_WIDTH, CONFLICT_DIALOG_HEIGHT, CONFLICT_DIALOG_HEIGHT)
+        }
+        DialogType::TarExcludeConfirm | DialogType::CopyExcludeConfirm => {
+            (60, 15, 15) // Exclude confirm dialog
+        }
+        DialogType::Settings => {
+            (42, 5, 5) // Settings dialog: width=42, height=5
         }
     };
 
@@ -317,7 +324,7 @@ pub fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, th
         DialogType::Goto => {
             draw_goto_dialog(frame, dialog, dialog_area, theme);
         }
-        DialogType::Search | DialogType::Mkdir | DialogType::Rename => {
+        DialogType::Search | DialogType::Mkdir | DialogType::Rename | DialogType::Tar => {
             draw_simple_input_dialog(frame, dialog, dialog_area, theme);
         }
         DialogType::Progress => {
@@ -326,6 +333,21 @@ pub fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, th
         DialogType::DuplicateConflict => {
             if let Some(ref state) = app.conflict_state {
                 draw_duplicate_conflict_dialog(frame, dialog, state, dialog_area, theme);
+            }
+        }
+        DialogType::TarExcludeConfirm => {
+            if let Some(ref state) = app.tar_exclude_state {
+                draw_tar_exclude_confirm_dialog(frame, dialog, state, dialog_area, theme);
+            }
+        }
+        DialogType::CopyExcludeConfirm => {
+            if let Some(ref state) = app.copy_exclude_state {
+                draw_copy_exclude_confirm_dialog(frame, dialog, state, dialog_area, theme);
+            }
+        }
+        DialogType::Settings => {
+            if let Some(ref state) = app.settings_state {
+                draw_settings_dialog(frame, state, dialog_area, theme);
             }
         }
     }
@@ -337,14 +359,16 @@ fn draw_simple_input_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, them
         DialogType::Search => " Find File ",
         DialogType::Mkdir => " Create Directory ",
         DialogType::Rename => " Rename ",
+        DialogType::Tar => " Create Archive ",
         _ => " Input ",
     };
 
     let block = Block::default()
         .title(title)
-        .title_style(theme.header_style())
+        .title_style(Style::default().fg(theme.dialog.title).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
-        .border_style(theme.border_style(true));
+        .border_style(Style::default().fg(theme.dialog.border))
+        .style(Style::default().bg(theme.dialog.bg));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -391,29 +415,48 @@ fn draw_simple_input_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, them
     };
 
     let cursor_style = Style::default()
-        .fg(theme.bg)
-        .bg(theme.border_active)
+        .fg(theme.dialog.input_cursor_fg)
+        .bg(theme.dialog.input_cursor_bg)
         .add_modifier(Modifier::SLOW_BLINK);
 
     let input_line = Line::from(vec![
-        Span::styled("> ", Style::default().fg(theme.info)),
-        Span::styled(before_cursor, theme.normal_style()),
+        Span::styled("> ", Style::default().fg(theme.dialog.input_prompt)),
+        Span::styled(before_cursor, Style::default().fg(theme.dialog.input_text)),
         Span::styled(cursor_char, cursor_style),
-        Span::styled(after_cursor, theme.normal_style()),
+        Span::styled(after_cursor, Style::default().fg(theme.dialog.input_text)),
     ]);
 
-    // 수직 중앙에 배치
-    let y_pos = inner.y + inner.height / 2;
-    let input_area = Rect::new(inner.x + 1, y_pos, inner.width - 2, 1);
-    frame.render_widget(Paragraph::new(input_line), input_area);
+    // Tar 다이얼로그의 경우 파일 목록 표시
+    if dialog.dialog_type == DialogType::Tar && !dialog.message.is_empty() {
+        let message_y = inner.y;
+        let message_area = Rect::new(inner.x + 1, message_y, inner.width - 2, 1);
+        // Use warning style for error messages (ending with !)
+        let message_style = if dialog.message.ends_with('!') {
+            theme.warning_style()
+        } else {
+            Style::default().fg(theme.dialog.text)
+        };
+        frame.render_widget(
+            Paragraph::new(dialog.message.clone()).style(message_style),
+            message_area,
+        );
+        let input_area = Rect::new(inner.x + 1, inner.y + 2, inner.width - 2, 1);
+        frame.render_widget(Paragraph::new(input_line), input_area);
+    } else {
+        // 수직 중앙에 배치
+        let y_pos = inner.y + inner.height / 2;
+        let input_area = Rect::new(inner.x + 1, y_pos, inner.width - 2, 1);
+        frame.render_widget(Paragraph::new(input_line), input_area);
+    }
 }
 
 fn draw_confirm_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &Theme, title: &str) {
     let block = Block::default()
         .title(title)
-        .title_style(theme.header_style())
+        .title_style(Style::default().fg(theme.dialog.title).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
-        .border_style(theme.border_style(true));
+        .border_style(Style::default().fg(theme.dialog.border))
+        .style(Style::default().bg(theme.dialog.bg));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -422,14 +465,16 @@ fn draw_confirm_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &T
     let message_area = Rect::new(inner.x + 1, inner.y + 1, inner.width - 2, 1);
     frame.render_widget(
         Paragraph::new(dialog.message.clone())
-            .style(theme.normal_style())
+            .style(Style::default().fg(theme.dialog.message_text))
             .alignment(ratatui::layout::Alignment::Center),
         message_area,
     );
 
     // 버튼 스타일
-    let selected_style = theme.selected_style();
-    let normal_style = theme.dim_style();
+    let selected_style = Style::default()
+        .fg(theme.dialog.button_selected_text)
+        .bg(theme.dialog.button_selected_bg);
+    let normal_style = Style::default().fg(theme.dialog.button_text);
 
     let yes_style = if dialog.selected_button == 0 { selected_style } else { normal_style };
     let no_style = if dialog.selected_button == 1 { selected_style } else { normal_style };
@@ -459,9 +504,10 @@ fn draw_copy_move_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: 
 
     let block = Block::default()
         .title(title)
-        .title_style(theme.header_style())
+        .title_style(Style::default().fg(theme.dialog.title).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
-        .border_style(theme.border_style(true));
+        .border_style(Style::default().fg(theme.dialog.border))
+        .style(Style::default().bg(theme.dialog.bg));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -476,7 +522,7 @@ fn draw_copy_move_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: 
     // 파일 목록 메시지
     let message_area = Rect::new(inner.x + 1, message_y, inner.width - 2, 1);
     frame.render_widget(
-        Paragraph::new(dialog.message.clone()).style(theme.normal_style()),
+        Paragraph::new(dialog.message.clone()).style(Style::default().fg(theme.dialog.text)),
         message_area,
     );
 
@@ -568,16 +614,16 @@ fn draw_copy_move_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: 
     };
 
     let cursor_style = Style::default()
-        .fg(theme.bg)
-        .bg(theme.border_active)
+        .fg(theme.dialog.input_cursor_fg)
+        .bg(theme.dialog.input_cursor_bg)
         .add_modifier(Modifier::SLOW_BLINK);
 
     let input_line = Line::from(vec![
-        Span::styled("> ", Style::default().fg(theme.info)),
-        Span::styled(before_cursor, theme.normal_style()),
+        Span::styled("> ", Style::default().fg(theme.dialog.input_prompt)),
+        Span::styled(before_cursor, Style::default().fg(theme.dialog.input_text)),
         Span::styled(cursor_char, cursor_style),
-        Span::styled(after_cursor, theme.normal_style()),
-        Span::styled(&display_preview_after, theme.dim_style()),
+        Span::styled(after_cursor, Style::default().fg(theme.dialog.input_text)),
+        Span::styled(&display_preview_after, Style::default().fg(theme.dialog.preview_suffix_text)),
     ]);
     let input_area = Rect::new(inner.x + 1, input_y, inner.width - 2, 1);
     frame.render_widget(Paragraph::new(input_line), input_area);
@@ -609,12 +655,12 @@ fn draw_copy_move_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: 
 
     // 하단 도움말
     let help_line = Line::from(vec![
-        Span::styled("Tab", theme.header_style()),
-        Span::styled(":complete ", theme.dim_style()),
-        Span::styled("Enter", theme.header_style()),
-        Span::styled(":confirm ", theme.dim_style()),
-        Span::styled("Esc", theme.header_style()),
-        Span::styled(":cancel", theme.dim_style()),
+        Span::styled("Tab", Style::default().fg(theme.dialog.help_key_text).add_modifier(Modifier::BOLD)),
+        Span::styled(":complete ", Style::default().fg(theme.dialog.help_label_text)),
+        Span::styled("Enter", Style::default().fg(theme.dialog.help_key_text).add_modifier(Modifier::BOLD)),
+        Span::styled(":confirm ", Style::default().fg(theme.dialog.help_label_text)),
+        Span::styled("Esc", Style::default().fg(theme.dialog.help_key_text).add_modifier(Modifier::BOLD)),
+        Span::styled(":cancel", Style::default().fg(theme.dialog.help_label_text)),
     ]);
     let help_area = Rect::new(inner.x + 1, help_y, inner.width - 2, 1);
     frame.render_widget(Paragraph::new(help_line), help_area);
@@ -632,9 +678,10 @@ fn draw_input_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &The
 
     let block = Block::default()
         .title(title)
-        .title_style(theme.header_style())
+        .title_style(Style::default().fg(theme.dialog.title).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
-        .border_style(theme.border_style(true));
+        .border_style(Style::default().fg(theme.dialog.border))
+        .style(Style::default().bg(theme.dialog.bg));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -642,7 +689,7 @@ fn draw_input_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &The
     // Prompt
     let prompt_area = Rect::new(inner.x + 1, inner.y + 1, inner.width - 2, 1);
     frame.render_widget(
-        Paragraph::new(dialog.message.clone()).style(theme.normal_style()),
+        Paragraph::new(dialog.message.clone()).style(Style::default().fg(theme.dialog.text)),
         prompt_area,
     );
 
@@ -658,15 +705,15 @@ fn draw_input_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &The
     };
 
     let input_line = Line::from(vec![
-        Span::styled("> ", Style::default().fg(theme.info)),
-        Span::styled(display_input, theme.normal_style()),
-        Span::styled("_", Style::default().fg(theme.border_active).add_modifier(Modifier::SLOW_BLINK)),
+        Span::styled("> ", Style::default().fg(theme.dialog.input_prompt)),
+        Span::styled(display_input, Style::default().fg(theme.dialog.input_text)),
+        Span::styled("_", Style::default().fg(theme.dialog.input_cursor_bg).add_modifier(Modifier::SLOW_BLINK)),
     ]);
     let input_area = Rect::new(inner.x + 1, inner.y + 3, inner.width - 2, 1);
     frame.render_widget(Paragraph::new(input_line), input_area);
 
     // Help
-    let help = Span::styled("[Enter] Confirm  [Esc] Cancel", theme.dim_style());
+    let help = Span::styled("[Enter] Confirm  [Esc] Cancel", Style::default().fg(theme.dialog.help_label_text));
     let help_area = Rect::new(inner.x + 1, inner.y + inner.height - 2, inner.width - 2, 1);
     frame.render_widget(Paragraph::new(help), help_area);
 }
@@ -677,9 +724,10 @@ fn draw_goto_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &Them
 
     let block = Block::default()
         .title(title)
-        .title_style(theme.header_style())
+        .title_style(Style::default().fg(theme.dialog.title).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
-        .border_style(theme.border_style(true));
+        .border_style(Style::default().fg(theme.dialog.border))
+        .style(Style::default().bg(theme.dialog.bg));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -791,17 +839,17 @@ fn draw_goto_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &Them
     };
 
     let cursor_style = Style::default()
-        .fg(theme.bg)
-        .bg(theme.border_active)
+        .fg(theme.dialog.input_cursor_fg)
+        .bg(theme.dialog.input_cursor_bg)
         .add_modifier(Modifier::SLOW_BLINK);
 
     // 입력 필드 렌더링 (선택된 항목 미리보기 포함)
     let input_line = Line::from(vec![
-        Span::styled("> ", Style::default().fg(theme.info)),
-        Span::styled(before_cursor, theme.normal_style()),
+        Span::styled("> ", Style::default().fg(theme.dialog.input_prompt)),
+        Span::styled(before_cursor, Style::default().fg(theme.dialog.input_text)),
         Span::styled(cursor_char, cursor_style),
-        Span::styled(after_cursor, theme.normal_style()),
-        Span::styled(&display_preview_after, theme.dim_style()),  // 흐리게 미리보기
+        Span::styled(after_cursor, Style::default().fg(theme.dialog.input_text)),
+        Span::styled(&display_preview_after, Style::default().fg(theme.dialog.preview_suffix_text)),  // 흐리게 미리보기
     ]);
     let input_area = Rect::new(inner.x + 1, input_y, inner.width - 2, 1);
     frame.render_widget(Paragraph::new(input_line), input_area);
@@ -832,35 +880,38 @@ fn draw_goto_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &Them
         }
     }
 
-    // Help (맨 아래에 표시) - 메인 화면 스타일과 통일
+    // Help (맨 아래에 표시)
+    let help_key_style = Style::default().fg(theme.dialog.help_key_text).add_modifier(Modifier::BOLD);
+    let help_label_style = Style::default().fg(theme.dialog.help_label_text);
+
     let help_line = if let Some(ref completion) = dialog.completion {
         if completion.visible && !completion.suggestions.is_empty() {
             Line::from(vec![
-                Span::styled("↑↓", theme.header_style()),
-                Span::styled(":select ", theme.dim_style()),
-                Span::styled("Tab", theme.header_style()),
-                Span::styled(":complete ", theme.dim_style()),
-                Span::styled("Enter", theme.header_style()),
-                Span::styled(":go ", theme.dim_style()),
-                Span::styled("Esc", theme.header_style()),
-                Span::styled(":cancel", theme.dim_style()),
+                Span::styled("↑↓", help_key_style),
+                Span::styled(":select ", help_label_style),
+                Span::styled("Tab", help_key_style),
+                Span::styled(":complete ", help_label_style),
+                Span::styled("Enter", help_key_style),
+                Span::styled(":go ", help_label_style),
+                Span::styled("Esc", help_key_style),
+                Span::styled(":cancel", help_label_style),
             ])
         } else {
             Line::from(vec![
-                Span::styled("Tab", theme.header_style()),
-                Span::styled(":complete ", theme.dim_style()),
-                Span::styled("Enter", theme.header_style()),
-                Span::styled(":go ", theme.dim_style()),
-                Span::styled("Esc", theme.header_style()),
-                Span::styled(":cancel", theme.dim_style()),
+                Span::styled("Tab", help_key_style),
+                Span::styled(":complete ", help_label_style),
+                Span::styled("Enter", help_key_style),
+                Span::styled(":go ", help_label_style),
+                Span::styled("Esc", help_key_style),
+                Span::styled(":cancel", help_label_style),
             ])
         }
     } else {
         Line::from(vec![
-            Span::styled("Enter", theme.header_style()),
-            Span::styled(":confirm ", theme.dim_style()),
-            Span::styled("Esc", theme.header_style()),
-            Span::styled(":cancel", theme.dim_style()),
+            Span::styled("Enter", help_key_style),
+            Span::styled(":confirm ", help_label_style),
+            Span::styled("Esc", help_key_style),
+            Span::styled(":cancel", help_label_style),
         ])
     };
 
@@ -878,16 +929,39 @@ fn draw_progress_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &Theme)
     let title = match progress.operation_type {
         FileOperationType::Copy => " Copying ",
         FileOperationType::Move => " Moving ",
+        FileOperationType::Tar => " Creating Archive ",
+        FileOperationType::Untar => " Extracting Archive ",
     };
 
     let block = Block::default()
         .title(title)
-        .title_style(theme.header_style())
+        .title_style(Style::default().fg(theme.dialog.title).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
-        .border_style(theme.border_style(true));
+        .border_style(Style::default().fg(theme.dialog.border))
+        .style(Style::default().bg(theme.dialog.bg));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    // Show spinner and preparing message during preparation phase
+    if progress.is_preparing {
+        // Spinner characters that rotate based on time
+        let spinner_chars = ['|', '/', '-', '\\'];
+        let spinner_idx = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() / 100) as usize % spinner_chars.len();
+        let spinner = spinner_chars[spinner_idx];
+
+        let preparing_line = Line::from(vec![
+            Span::styled(format!("{} ", spinner), Style::default().fg(theme.dialog.progress_bar_fill)),
+            Span::styled(&progress.preparing_message, Style::default().fg(theme.dialog.progress_value_text)),
+        ]);
+        let preparing_area = Rect::new(inner.x + 1, inner.y + 1, inner.width - 2, 1);
+        frame.render_widget(Paragraph::new(preparing_line), preparing_area);
+
+        return;
+    }
 
     // Current file name (truncated if needed)
     let max_filename_len = (inner.width - 8) as usize;
@@ -898,8 +972,8 @@ fn draw_progress_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &Theme)
     };
 
     let file_line = Line::from(vec![
-        Span::styled("File: ", theme.dim_style()),
-        Span::styled(current_file, theme.normal_style()),
+        Span::styled("File: ", Style::default().fg(theme.dialog.progress_label_text)),
+        Span::styled(current_file, Style::default().fg(theme.dialog.progress_value_text)),
     ]);
     let file_area = Rect::new(inner.x + 1, inner.y, inner.width - 2, 1);
     frame.render_widget(Paragraph::new(file_line), file_area);
@@ -909,59 +983,58 @@ fn draw_progress_dialog(frame: &mut Frame, app: &App, area: Rect, theme: &Theme)
     let file_progress_percent = (progress.current_file_progress * 100.0) as u8;
     let file_filled = (progress.current_file_progress * bar_width as f64) as usize;
     let file_empty = bar_width.saturating_sub(file_filled);
-    let file_bar = format!(
-        "{}{}",
-        "█".repeat(file_filled),
-        "░".repeat(file_empty)
-    );
+    let file_bar_fill = "█".repeat(file_filled);
+    let file_bar_empty = "░".repeat(file_empty);
 
     let file_bar_line = Line::from(vec![
-        Span::styled(file_bar, theme.info_style()),
-        Span::styled(format!(" {:3}%", file_progress_percent), theme.normal_style()),
+        Span::styled(file_bar_fill, Style::default().fg(theme.dialog.progress_bar_fill)),
+        Span::styled(file_bar_empty, Style::default().fg(theme.dialog.progress_bar_empty)),
+        Span::styled(format!(" {:3}%", file_progress_percent), Style::default().fg(theme.dialog.progress_percent_text)),
     ]);
     let file_bar_area = Rect::new(inner.x + 1, inner.y + 1, inner.width - 2, 1);
     frame.render_widget(Paragraph::new(file_bar_line), file_bar_area);
 
     // Total progress info
-    let total_info = format!(
-        "{}/{} files ({}/{})",
-        progress.completed_files,
-        progress.total_files,
-        format_size(progress.completed_bytes),
-        format_size(progress.total_bytes),
-    );
-    let total_line = Line::from(Span::styled(total_info, theme.dim_style()));
+    let total_info = if progress.operation_type == FileOperationType::Tar
+        || progress.operation_type == FileOperationType::Untar {
+        if progress.total_files > 0 {
+            format!("{}/{} files", progress.completed_files, progress.total_files)
+        } else {
+            format!("{} files processed", progress.completed_files)
+        }
+    } else {
+        format!(
+            "{}/{} files ({}/{})",
+            progress.completed_files,
+            progress.total_files,
+            format_size(progress.completed_bytes),
+            format_size(progress.total_bytes),
+        )
+    };
+    let total_line = Line::from(Span::styled(total_info, Style::default().fg(theme.dialog.progress_label_text)));
     let total_area = Rect::new(inner.x + 1, inner.y + 3, inner.width - 2, 1);
     frame.render_widget(Paragraph::new(total_line), total_area);
 
-    // Total progress bar
-    let total_progress = progress.overall_progress();
-    let total_progress_percent = (total_progress * 100.0) as u8;
-    let total_filled = (total_progress * bar_width as f64) as usize;
-    let total_empty = bar_width.saturating_sub(total_filled);
-    let total_bar = format!(
-        "{}{}",
-        "█".repeat(total_filled),
-        "░".repeat(total_empty)
-    );
+    // Total progress bar - use determinate style if we know total count
+    let use_determinate = progress.total_files > 0;
 
-    let total_bar_line = Line::from(vec![
-        Span::styled(total_bar, theme.info_style()),
-        Span::styled(format!(" {:3}%", total_progress_percent), theme.normal_style()),
-    ]);
-    let total_bar_area = Rect::new(inner.x + 1, inner.y + 4, inner.width - 2, 1);
-    frame.render_widget(Paragraph::new(total_bar_line), total_bar_area);
+    if use_determinate {
+        let total_progress = progress.overall_progress();
+        let total_progress_percent = (total_progress * 100.0) as u8;
+        let total_filled = (total_progress * bar_width as f64) as usize;
+        let total_empty = bar_width.saturating_sub(total_filled);
+        let total_bar_fill = "█".repeat(total_filled);
+        let total_bar_empty = "░".repeat(total_empty);
 
-    // Help text
-    let help_line = Line::from(Span::styled(
-        "Press ESC to cancel",
-        theme.dim_style(),
-    ));
-    let help_area = Rect::new(inner.x + 1, inner.y + inner.height - 2, inner.width - 2, 1);
-    frame.render_widget(
-        Paragraph::new(help_line).alignment(ratatui::layout::Alignment::Center),
-        help_area,
-    );
+        let total_bar_line = Line::from(vec![
+            Span::styled(total_bar_fill, Style::default().fg(theme.dialog.progress_bar_fill)),
+            Span::styled(total_bar_empty, Style::default().fg(theme.dialog.progress_bar_empty)),
+            Span::styled(format!(" {:3}%", total_progress_percent), Style::default().fg(theme.dialog.progress_percent_text)),
+        ]);
+        let total_bar_area = Rect::new(inner.x + 1, inner.y + 4, inner.width - 2, 1);
+        frame.render_widget(Paragraph::new(total_bar_line), total_bar_area);
+    }
+    // Indeterminate progress: don't show progress bar or percentage
 }
 
 /// Duplicate conflict dialog for file paste operations
@@ -974,9 +1047,10 @@ fn draw_duplicate_conflict_dialog(
 ) {
     let block = Block::default()
         .title(" File Exists ")
-        .title_style(theme.header_style())
+        .title_style(Style::default().fg(theme.dialog.title).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
-        .border_style(theme.border_style(true));
+        .border_style(Style::default().fg(theme.dialog.border))
+        .style(Style::default().bg(theme.dialog.bg));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -989,7 +1063,7 @@ fn draw_duplicate_conflict_dialog(
     // Line 1: "File already exists:"
     let label_area = Rect::new(inner.x + 2, inner.y + 1, inner.width - 4, 1);
     frame.render_widget(
-        Paragraph::new("File already exists:").style(theme.normal_style()),
+        Paragraph::new("File already exists:").style(Style::default().fg(theme.dialog.text)),
         label_area,
     );
 
@@ -1002,7 +1076,7 @@ fn draw_duplicate_conflict_dialog(
     };
     let filename_area = Rect::new(inner.x + 2, inner.y + 2, inner.width - 4, 1);
     frame.render_widget(
-        Paragraph::new(truncated_name).style(theme.info_style()),
+        Paragraph::new(truncated_name).style(Style::default().fg(theme.dialog.conflict_filename_text)),
         filename_area,
     );
 
@@ -1013,7 +1087,7 @@ fn draw_duplicate_conflict_dialog(
     let progress_text = format!("({} of {} {})", current, total, conflict_word);
     let progress_area = Rect::new(inner.x + 2, inner.y + 3, inner.width - 4, 1);
     frame.render_widget(
-        Paragraph::new(progress_text).style(theme.dim_style()),
+        Paragraph::new(progress_text).style(Style::default().fg(theme.dialog.conflict_count_text)),
         progress_area,
     );
 
@@ -1022,58 +1096,256 @@ fn draw_duplicate_conflict_dialog(
     // Row 2: Overwrite All (2), Skip All (3)
     let selected = dialog.selected_button;
 
-    let normal_style = theme.dim_style();
-    let selected_style = theme.selected_style();
-
     // Calculate button positions
     let button_y1 = inner.y + 5;
     let button_y2 = inner.y + 6;
     let col1_x = inner.x + 4;
     let col2_x = inner.x + inner.width / 2 + 2;
 
-    // Button labels with shortcuts
-    let btn_overwrite = " [O]verwrite ";
-    let btn_skip = " [S]kip ";
-    let btn_overwrite_all = " Overwrite [A]ll ";
-    let btn_skip_all = " Skip A[l]l ";
+    // Style helpers
+    let key_fg = theme.dialog.conflict_shortcut_text;
+    let get_styles = |is_selected: bool| {
+        let bg = if is_selected { theme.dialog.button_selected_bg } else { theme.dialog.bg };
+        let fg = if is_selected { theme.dialog.button_selected_text } else { theme.dialog.button_text };
+        (
+            Style::default().fg(fg).bg(bg),
+            Style::default().fg(key_fg).bg(bg).add_modifier(Modifier::BOLD),
+        )
+    };
 
-    // Row 1
-    let overwrite_style = if selected == 0 { selected_style } else { normal_style };
-    let skip_style = if selected == 1 { selected_style } else { normal_style };
-    frame.render_widget(
-        Paragraph::new(btn_overwrite).style(overwrite_style),
-        Rect::new(col1_x, button_y1, btn_overwrite.len() as u16, 1),
-    );
-    frame.render_widget(
-        Paragraph::new(btn_skip).style(skip_style),
-        Rect::new(col2_x, button_y1, btn_skip.len() as u16, 1),
-    );
-
-    // Row 2
-    let overwrite_all_style = if selected == 2 { selected_style } else { normal_style };
-    let skip_all_style = if selected == 3 { selected_style } else { normal_style };
-    frame.render_widget(
-        Paragraph::new(btn_overwrite_all).style(overwrite_all_style),
-        Rect::new(col1_x, button_y2, btn_overwrite_all.len() as u16, 1),
-    );
-    frame.render_widget(
-        Paragraph::new(btn_skip_all).style(skip_all_style),
-        Rect::new(col2_x, button_y2, btn_skip_all.len() as u16, 1),
-    );
-
-    // Help text at bottom
-    let help_line = Line::from(vec![
-        Span::styled("←→↑↓", theme.header_style()),
-        Span::styled(":select ", theme.dim_style()),
-        Span::styled("Enter", theme.header_style()),
-        Span::styled(":confirm ", theme.dim_style()),
-        Span::styled("Esc", theme.header_style()),
-        Span::styled(":cancel", theme.dim_style()),
+    // Row 1: Overwrite, Skip
+    let (style, key_style) = get_styles(selected == 0);
+    let btn_overwrite = Line::from(vec![
+        Span::styled(" ", style),
+        Span::styled("O", key_style),
+        Span::styled("verwrite ", style),
     ]);
-    let help_area = Rect::new(inner.x + 1, inner.y + inner.height - 1, inner.width - 2, 1);
+    frame.render_widget(Paragraph::new(btn_overwrite), Rect::new(col1_x, button_y1, 11, 1));
+
+    let (style, key_style) = get_styles(selected == 1);
+    let btn_skip = Line::from(vec![
+        Span::styled(" ", style),
+        Span::styled("S", key_style),
+        Span::styled("kip ", style),
+    ]);
+    frame.render_widget(Paragraph::new(btn_skip), Rect::new(col2_x, button_y1, 6, 1));
+
+    // Row 2: Overwrite All, Skip All
+    let (style, key_style) = get_styles(selected == 2);
+    let btn_overwrite_all = Line::from(vec![
+        Span::styled(" Overwrite ", style),
+        Span::styled("A", key_style),
+        Span::styled("ll ", style),
+    ]);
+    frame.render_widget(Paragraph::new(btn_overwrite_all), Rect::new(col1_x, button_y2, 15, 1));
+
+    let (style, key_style) = get_styles(selected == 3);
+    let btn_skip_all = Line::from(vec![
+        Span::styled(" Skip A", style),
+        Span::styled("l", key_style),
+        Span::styled("l ", style),
+    ]);
+    frame.render_widget(Paragraph::new(btn_skip_all), Rect::new(col2_x, button_y2, 10, 1));
+}
+
+/// Tar exclude confirmation dialog
+fn draw_tar_exclude_confirm_dialog(
+    frame: &mut Frame,
+    dialog: &Dialog,
+    state: &crate::ui::app::TarExcludeState,
+    area: Rect,
+    theme: &Theme,
+) {
+    let block = Block::default()
+        .title(" Exclude Unsafe Symlinks ")
+        .title_style(Style::default().fg(theme.dialog.tar_exclude_title).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.dialog.tar_exclude_border))
+        .style(Style::default().bg(theme.dialog.tar_exclude_bg));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Message line
+    let msg = format!(
+        "Found {} unsafe symlink(s) that will be excluded:",
+        state.excluded_paths.len()
+    );
+    let msg_area = Rect::new(inner.x + 2, inner.y + 1, inner.width - 4, 1);
     frame.render_widget(
-        Paragraph::new(help_line).alignment(ratatui::layout::Alignment::Center),
-        help_area,
+        Paragraph::new(msg).style(Style::default().fg(theme.dialog.tar_exclude_message_text)),
+        msg_area,
+    );
+
+    // List of excluded paths (scrollable)
+    let list_height = (inner.height - 5) as usize; // Reserve space for message and buttons
+    let visible_paths: Vec<&String> = state.excluded_paths
+        .iter()
+        .skip(state.scroll_offset)
+        .take(list_height)
+        .collect();
+
+    for (i, path) in visible_paths.iter().enumerate() {
+        let y = inner.y + 2 + i as u16;
+        let display_path = if path.len() > (inner.width - 6) as usize {
+            format!("  ...{}", &path[path.len().saturating_sub((inner.width - 9) as usize)..])
+        } else {
+            format!("  {}", path)
+        };
+        frame.render_widget(
+            Paragraph::new(display_path).style(Style::default().fg(theme.dialog.tar_exclude_path_text)),
+            Rect::new(inner.x + 2, y, inner.width - 4, 1),
+        );
+    }
+
+    // Scroll indicator if needed
+    if state.excluded_paths.len() > list_height {
+        let scroll_info = format!(
+            "[{}-{}/{}]",
+            state.scroll_offset + 1,
+            (state.scroll_offset + list_height).min(state.excluded_paths.len()),
+            state.excluded_paths.len()
+        );
+        let scroll_area = Rect::new(
+            inner.x + inner.width - scroll_info.len() as u16 - 2,
+            inner.y + 1,
+            scroll_info.len() as u16,
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(scroll_info).style(Style::default().fg(theme.dialog.tar_exclude_scroll_info)),
+            scroll_area,
+        );
+    }
+
+    // Buttons: Proceed / Cancel
+    let selected = dialog.selected_button;
+    let button_y = inner.y + inner.height - 2;
+
+    let normal_style = Style::default().fg(theme.dialog.tar_exclude_button_text);
+    let selected_style = Style::default()
+        .fg(theme.dialog.tar_exclude_button_selected_text)
+        .bg(theme.dialog.tar_exclude_button_selected_bg);
+
+    let btn_proceed = " Proceed ";
+    let btn_cancel = " Cancel ";
+
+    let proceed_style = if selected == 0 { selected_style } else { normal_style };
+    let cancel_style = if selected == 1 { selected_style } else { normal_style };
+
+    let btn_width = btn_proceed.len() + btn_cancel.len() + 4;
+    let btn_start = inner.x + (inner.width - btn_width as u16) / 2;
+
+    frame.render_widget(
+        Paragraph::new(btn_proceed).style(proceed_style),
+        Rect::new(btn_start, button_y, btn_proceed.len() as u16, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(btn_cancel).style(cancel_style),
+        Rect::new(btn_start + btn_proceed.len() as u16 + 4, button_y, btn_cancel.len() as u16, 1),
+    );
+}
+
+/// Copy/Move exclude confirmation dialog
+fn draw_copy_exclude_confirm_dialog(
+    frame: &mut Frame,
+    dialog: &Dialog,
+    state: &crate::ui::app::CopyExcludeState,
+    area: Rect,
+    theme: &Theme,
+) {
+    let title = if state.is_move {
+        " Move: Sensitive Symlinks "
+    } else {
+        " Copy: Sensitive Symlinks "
+    };
+    let block = Block::default()
+        .title(title)
+        .title_style(Style::default().fg(theme.dialog.tar_exclude_title).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.dialog.tar_exclude_border))
+        .style(Style::default().bg(theme.dialog.tar_exclude_bg));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Message line
+    let msg = format!(
+        "Found {} symlink(s) pointing to sensitive paths:",
+        state.excluded_paths.len()
+    );
+    let msg_area = Rect::new(inner.x + 2, inner.y + 1, inner.width - 4, 1);
+    frame.render_widget(
+        Paragraph::new(msg).style(Style::default().fg(theme.dialog.tar_exclude_message_text)),
+        msg_area,
+    );
+
+    // List of excluded paths (scrollable)
+    let list_height = (inner.height - 5) as usize;
+    let visible_paths: Vec<&String> = state.excluded_paths
+        .iter()
+        .skip(state.scroll_offset)
+        .take(list_height)
+        .collect();
+
+    for (i, path) in visible_paths.iter().enumerate() {
+        let y = inner.y + 2 + i as u16;
+        let display_path = if path.len() > (inner.width - 6) as usize {
+            format!("  ...{}", &path[path.len().saturating_sub((inner.width - 9) as usize)..])
+        } else {
+            format!("  {}", path)
+        };
+        frame.render_widget(
+            Paragraph::new(display_path).style(Style::default().fg(theme.dialog.tar_exclude_path_text)),
+            Rect::new(inner.x + 2, y, inner.width - 4, 1),
+        );
+    }
+
+    // Scroll indicator if needed
+    if state.excluded_paths.len() > list_height {
+        let scroll_info = format!(
+            "[{}-{}/{}]",
+            state.scroll_offset + 1,
+            (state.scroll_offset + list_height).min(state.excluded_paths.len()),
+            state.excluded_paths.len()
+        );
+        let scroll_area = Rect::new(
+            inner.x + inner.width - scroll_info.len() as u16 - 2,
+            inner.y + 1,
+            scroll_info.len() as u16,
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(scroll_info).style(Style::default().fg(theme.dialog.tar_exclude_scroll_info)),
+            scroll_area,
+        );
+    }
+
+    // Buttons: Proceed / Cancel
+    let selected = dialog.selected_button;
+    let button_y = inner.y + inner.height - 2;
+
+    let normal_style = Style::default().fg(theme.dialog.tar_exclude_button_text);
+    let selected_style = Style::default()
+        .fg(theme.dialog.tar_exclude_button_selected_text)
+        .bg(theme.dialog.tar_exclude_button_selected_bg);
+
+    let btn_proceed = " Proceed ";
+    let btn_cancel = " Cancel ";
+
+    let proceed_style = if selected == 0 { selected_style } else { normal_style };
+    let cancel_style = if selected == 1 { selected_style } else { normal_style };
+
+    let btn_width = btn_proceed.len() + btn_cancel.len() + 4;
+    let btn_start = inner.x + (inner.width - btn_width as u16) / 2;
+
+    frame.render_widget(
+        Paragraph::new(btn_proceed).style(proceed_style),
+        Rect::new(btn_start, button_y, btn_proceed.len() as u16, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(btn_cancel).style(cancel_style),
+        Rect::new(btn_start + btn_proceed.len() as u16 + 4, button_y, btn_cancel.len() as u16, 1),
     );
 }
 
@@ -1122,11 +1394,11 @@ fn draw_completion_list(
         .collect();
 
     let selected_style = Style::default()
-        .bg(theme.bg_selected)
-        .fg(theme.text_selected)
+        .bg(theme.dialog.autocomplete_selected_bg)
+        .fg(theme.dialog.autocomplete_selected_text)
         .add_modifier(Modifier::BOLD);
-    let dir_style = Style::default().fg(theme.text_directory);
-    let file_style = theme.normal_style();
+    let dir_style = Style::default().fg(theme.dialog.autocomplete_directory_text);
+    let file_style = Style::default().fg(theme.dialog.autocomplete_text);
 
     for (i, suggestion) in visible_items.iter().enumerate() {
         let actual_index = scroll_offset + i;
@@ -1166,7 +1438,7 @@ fn draw_completion_list(
         let info_x = area.x + area.width.saturating_sub(info_len + 1);
         let info_y = area.y;
         frame.render_widget(
-            Paragraph::new(Span::styled(scroll_info, theme.dim_style())),
+            Paragraph::new(Span::styled(scroll_info, Style::default().fg(theme.dialog.autocomplete_scroll_info))),
             Rect::new(info_x, info_y, info_len + 1, 1),
         );
     }
@@ -1236,16 +1508,41 @@ pub fn handle_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers
             DialogType::DuplicateConflict => {
                 return handle_duplicate_conflict_input(app, code, modifiers);
             }
+            DialogType::TarExcludeConfirm => {
+                return handle_tar_exclude_confirm_input(app, code);
+            }
+            DialogType::CopyExcludeConfirm => {
+                return handle_copy_exclude_confirm_input(app, code);
+            }
+            DialogType::Settings => {
+                return handle_settings_dialog_input(app, code);
+            }
             _ => {
                 match code {
                     KeyCode::Enter => {
                         let input = dialog.input.clone();
                         let dialog_type = dialog.dialog_type;
+
+                        // For Tar dialog, check if archive already exists before closing
+                        if dialog_type == DialogType::Tar && !input.trim().is_empty() {
+                            // Get path before modifying dialog
+                            let current_path = app.active_panel().path.clone();
+                            let archive_path = current_path.join(&input);
+                            if archive_path.exists() {
+                                // Update dialog message to show error, keep dialog open
+                                if let Some(ref mut d) = app.dialog {
+                                    d.message = format!("'{}' already exists!", input);
+                                }
+                                return false;
+                            }
+                        }
+
                         app.dialog = None;
                         if !input.trim().is_empty() {
                             match dialog_type {
                                 DialogType::Mkdir => app.execute_mkdir(&input),
                                 DialogType::Rename => app.execute_rename(&input),
+                                DialogType::Tar => app.execute_tar(&input),
                                 DialogType::Search => app.execute_search(&input),
                                 DialogType::Goto => app.execute_goto(&input),
                                 _ => {}
@@ -1728,6 +2025,116 @@ fn handle_progress_dialog_input(app: &mut App, code: KeyCode) -> bool {
     false
 }
 
+/// Handle tar exclude confirmation dialog input
+fn handle_tar_exclude_confirm_input(app: &mut App, code: KeyCode) -> bool {
+    if let Some(ref mut dialog) = app.dialog {
+        match code {
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                // Toggle between Proceed (0) and Cancel (1)
+                dialog.selected_button = if dialog.selected_button == 0 { 1 } else { 0 };
+            }
+            KeyCode::Up => {
+                // Scroll up in the list
+                if let Some(ref mut state) = app.tar_exclude_state {
+                    if state.scroll_offset > 0 {
+                        state.scroll_offset -= 1;
+                    }
+                }
+            }
+            KeyCode::Down => {
+                // Scroll down in the list
+                if let Some(ref mut state) = app.tar_exclude_state {
+                    if state.scroll_offset + 8 < state.excluded_paths.len() {
+                        state.scroll_offset += 1;
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                if dialog.selected_button == 0 {
+                    // Proceed - execute tar with exclusions
+                    if let Some(state) = app.tar_exclude_state.take() {
+                        app.dialog = None;
+                        app.execute_tar_with_excludes(
+                            &state.archive_name,
+                            &state.files,
+                            &state.excluded_paths,
+                        );
+                    }
+                } else {
+                    // Cancel
+                    app.tar_exclude_state = None;
+                    app.dialog = None;
+                    app.show_message("Tar operation cancelled");
+                }
+                return false;
+            }
+            KeyCode::Esc => {
+                // Cancel
+                app.tar_exclude_state = None;
+                app.dialog = None;
+                app.show_message("Tar operation cancelled");
+                return false;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Handle copy exclude confirmation dialog input
+fn handle_copy_exclude_confirm_input(app: &mut App, code: KeyCode) -> bool {
+    if let Some(ref mut dialog) = app.dialog {
+        match code {
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                dialog.selected_button = if dialog.selected_button == 0 { 1 } else { 0 };
+            }
+            KeyCode::Up => {
+                if let Some(ref mut state) = app.copy_exclude_state {
+                    if state.scroll_offset > 0 {
+                        state.scroll_offset -= 1;
+                    }
+                }
+            }
+            KeyCode::Down => {
+                if let Some(ref mut state) = app.copy_exclude_state {
+                    if state.scroll_offset + 8 < state.excluded_paths.len() {
+                        state.scroll_offset += 1;
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                if dialog.selected_button == 0 {
+                    // Proceed - execute copy/move (skip symlink check)
+                    if let Some(state) = app.copy_exclude_state.take() {
+                        app.dialog = None;
+                        if state.is_move {
+                            app.execute_move_to_with_progress_internal(&state.target_path);
+                        } else {
+                            app.execute_copy_to_with_progress_internal(&state.target_path);
+                        }
+                    }
+                } else {
+                    // Cancel
+                    let is_move = app.copy_exclude_state.as_ref().map(|s| s.is_move).unwrap_or(false);
+                    app.copy_exclude_state = None;
+                    app.dialog = None;
+                    app.show_message(if is_move { "Move operation cancelled" } else { "Copy operation cancelled" });
+                }
+                return false;
+            }
+            KeyCode::Esc => {
+                let is_move = app.copy_exclude_state.as_ref().map(|s| s.is_move).unwrap_or(false);
+                app.copy_exclude_state = None;
+                app.dialog = None;
+                app.show_message(if is_move { "Move operation cancelled" } else { "Copy operation cancelled" });
+                return false;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Handle duplicate conflict dialog input
 fn handle_duplicate_conflict_input(app: &mut App, code: KeyCode, _modifiers: KeyModifiers) -> bool {
     if let Some(ref mut dialog) = app.dialog {
@@ -1890,6 +2297,77 @@ fn advance_to_next_conflict(state: &mut ConflictState) -> bool {
 fn finish_conflict_resolution(app: &mut App) {
     app.dialog = None;
     app.execute_paste_with_conflicts();
+}
+
+/// Handle settings dialog input
+fn handle_settings_dialog_input(app: &mut App, code: KeyCode) -> bool {
+    match code {
+        KeyCode::Esc => {
+            app.cancel_settings_dialog();
+        }
+        KeyCode::Enter => {
+            app.apply_settings_from_dialog();
+        }
+        KeyCode::Left => {
+            if let Some(ref mut state) = app.settings_state {
+                state.prev_theme();
+                // Apply theme immediately for preview
+                let theme_name = state.current_theme();
+                app.theme = crate::ui::theme::Theme::load(theme_name);
+            }
+        }
+        KeyCode::Right | KeyCode::Char(' ') => {
+            if let Some(ref mut state) = app.settings_state {
+                state.next_theme();
+                // Apply theme immediately for preview
+                let theme_name = state.current_theme();
+                app.theme = crate::ui::theme::Theme::load(theme_name);
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
+/// Draw settings dialog
+fn draw_settings_dialog(frame: &mut Frame, state: &SettingsState, area: Rect, theme: &Theme) {
+    let block = Block::default()
+        .title(" Settings ")
+        .title_style(Style::default().fg(theme.settings.title).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.settings.border))
+        .style(Style::default().bg(theme.settings.bg));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Theme setting
+    let theme_value = format!("< {} >", state.current_theme());
+    lines.push(Line::from(vec![
+        Span::styled("> ", Style::default().fg(theme.settings.prompt)),
+        Span::styled("Theme: ", Style::default().fg(theme.settings.label_text)),
+        Span::styled(
+            theme_value,
+            Style::default().fg(theme.settings.value_text).bg(theme.settings.value_bg),
+        ),
+    ]));
+
+    lines.push(Line::from(""));
+
+    // Help line
+    lines.push(Line::from(vec![
+        Span::styled("←→/Space", Style::default().fg(theme.settings.help_key)),
+        Span::styled(" Change  ", Style::default().fg(theme.settings.help_text)),
+        Span::styled("Enter", Style::default().fg(theme.settings.help_key)),
+        Span::styled(" Save  ", Style::default().fg(theme.settings.help_text)),
+        Span::styled("Esc", Style::default().fg(theme.settings.help_key)),
+        Span::styled(" Cancel", Style::default().fg(theme.settings.help_text)),
+    ]));
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, inner);
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 import { motion } from 'framer-motion'
-import { Columns, Bot, Keyboard, Eye, Zap, Activity } from 'lucide-react'
+import { Columns, Bot, Keyboard, Eye, Zap, Activity, Image, Search, Palette } from 'lucide-react'
 import Card from './ui/Card'
 
 const features: { icon: typeof Zap; title: string; description: string; highlight?: boolean }[] = [
@@ -27,12 +27,27 @@ const features: { icon: typeof Zap; title: string; description: string; highligh
   {
     icon: Eye,
     title: 'Built-in Viewer & Editor',
-    description: 'View and edit files directly without leaving the application. Search functionality included.',
+    description: 'View and edit files with syntax highlighting for 20+ languages. Search, replace, bookmarks, and hex mode included.',
+  },
+  {
+    icon: Image,
+    title: 'Image Viewer',
+    description: 'View images directly in the terminal with zoom and pan support. Navigate through images in a directory.',
   },
   {
     icon: Activity,
     title: 'Process Manager',
     description: 'Monitor and manage system processes. Sort by CPU, memory, or PID. Kill processes with ease.',
+  },
+  {
+    icon: Search,
+    title: 'File Search',
+    description: 'Find files by name pattern with recursive search. Quickly locate files across directories.',
+  },
+  {
+    icon: Palette,
+    title: 'Customizable Themes',
+    description: 'Light and dark themes with full color customization. Create your own themes with JSON configuration.',
   },
 ]
 

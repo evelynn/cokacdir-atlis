@@ -7,10 +7,28 @@ use std::sync::Arc;
 use std::thread;
 use chrono::{DateTime, Local};
 
+use crate::config::Settings;
 use crate::services::file_ops::{self, FileOperationType, ProgressMessage, FileOperationResult};
 use crate::ui::file_viewer::ViewerState;
 use crate::ui::file_editor::EditorState;
 use crate::ui::file_info::FileInfoState;
+
+/// Help screen state for scrolling
+pub struct HelpState {
+    pub scroll_offset: usize,
+    pub max_scroll: usize,
+    pub visible_height: usize,
+}
+
+impl Default for HelpState {
+    fn default() -> Self {
+        Self {
+            scroll_offset: 0,
+            max_scroll: 0,
+            visible_height: 0,
+        }
+    }
+}
 
 /// Get a valid directory path, falling back to parent directories if needed
 pub fn get_valid_path(target_path: &Path, fallback: &Path) -> PathBuf {
@@ -54,6 +72,7 @@ pub enum PanelSide {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortBy {
     Name,
+    Type,
     Size,
     Modified,
 }
@@ -88,10 +107,76 @@ pub enum DialogType {
     Rename,
     Search,
     Goto,
+    Tar,
+    TarExcludeConfirm,
+    CopyExcludeConfirm,
     LargeImageConfirm,
     TrueColorWarning,
     Progress,
     DuplicateConflict,
+    Settings,
+}
+
+/// Settings dialog state
+#[derive(Debug, Clone)]
+pub struct SettingsState {
+    /// Available theme names (from ~/.cokacdir/themes/)
+    pub themes: Vec<String>,
+    /// Currently selected theme index
+    pub theme_index: usize,
+}
+
+impl SettingsState {
+    pub fn new(settings: &Settings) -> Self {
+        // Scan available themes
+        let mut themes = vec!["light".to_string(), "dark".to_string()];
+        if let Some(themes_dir) = Settings::themes_dir() {
+            if let Ok(entries) = std::fs::read_dir(&themes_dir) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let path = entry.path();
+                    if path.extension().map(|e| e == "json").unwrap_or(false) {
+                        if let Some(stem) = path.file_stem() {
+                            let name = stem.to_string_lossy().to_string();
+                            if !themes.contains(&name) {
+                                themes.push(name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        themes.sort();
+
+        // Find current theme index
+        let theme_index = themes.iter()
+            .position(|t| t == &settings.theme.name)
+            .unwrap_or(0);
+
+        Self {
+            themes,
+            theme_index,
+        }
+    }
+
+    pub fn current_theme(&self) -> &str {
+        self.themes.get(self.theme_index).map(|s| s.as_str()).unwrap_or("light")
+    }
+
+    pub fn next_theme(&mut self) {
+        if !self.themes.is_empty() {
+            self.theme_index = (self.theme_index + 1) % self.themes.len();
+        }
+    }
+
+    pub fn prev_theme(&mut self) {
+        if !self.themes.is_empty() {
+            self.theme_index = if self.theme_index == 0 {
+                self.themes.len() - 1
+            } else {
+                self.theme_index - 1
+            };
+        }
+    }
 }
 
 /// Resolution option for duplicate file conflicts
@@ -118,6 +203,34 @@ pub struct ConflictState {
     pub clipboard_backup: Option<Clipboard>,
     /// Whether this is a move (cut) operation
     pub is_move_operation: bool,
+    /// Target directory for the operation
+    pub target_path: PathBuf,
+}
+
+/// State for tar exclude confirmation dialog
+#[derive(Debug, Clone)]
+pub struct TarExcludeState {
+    /// Archive name to create
+    pub archive_name: String,
+    /// Files to archive
+    pub files: Vec<String>,
+    /// Paths to exclude (unsafe symlinks)
+    pub excluded_paths: Vec<String>,
+    /// Scroll offset for viewing excluded paths
+    pub scroll_offset: usize,
+}
+
+/// State for copy/move exclude confirmation dialog
+#[derive(Debug, Clone)]
+pub struct CopyExcludeState {
+    /// Target path for copy/move
+    pub target_path: PathBuf,
+    /// Paths with sensitive symlinks
+    pub excluded_paths: Vec<String>,
+    /// Scroll offset for viewing excluded paths
+    pub scroll_offset: usize,
+    /// Whether this is a move operation (vs copy)
+    pub is_move: bool,
 }
 
 /// Clipboard operation type for Ctrl+C/X/V operations
@@ -140,7 +253,11 @@ pub struct FileOperationProgress {
     pub operation_type: FileOperationType,
     pub is_active: bool,
     pub cancel_flag: Arc<AtomicBool>,
-    receiver: Option<Receiver<ProgressMessage>>,
+    pub receiver: Option<Receiver<ProgressMessage>>,
+
+    // Preparation state
+    pub is_preparing: bool,
+    pub preparing_message: String,
 
     // Progress state
     pub current_file: String,
@@ -163,6 +280,8 @@ impl FileOperationProgress {
             is_active: false,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             receiver: None,
+            is_preparing: false,
+            preparing_message: String::new(),
             current_file: String::new(),
             current_file_progress: 0.0,
             total_files: 0,
@@ -191,6 +310,14 @@ impl FileOperationProgress {
                 match receiver.try_recv() {
                     Ok(msg) => {
                         match msg {
+                            ProgressMessage::Preparing(message) => {
+                                self.is_preparing = true;
+                                self.preparing_message = message;
+                            }
+                            ProgressMessage::PrepareComplete => {
+                                self.is_preparing = false;
+                                self.preparing_message.clear();
+                            }
                             ProgressMessage::FileStarted(name) => {
                                 self.current_file = name;
                                 self.current_file_progress = 0.0;
@@ -277,6 +404,42 @@ pub struct FileItem {
     pub permissions: String,
 }
 
+/// Parse sort_by string from settings to SortBy enum
+pub fn parse_sort_by(s: &str) -> SortBy {
+    match s.to_lowercase().as_str() {
+        "type" => SortBy::Type,
+        "size" => SortBy::Size,
+        "modified" | "date" => SortBy::Modified,
+        _ => SortBy::Name,
+    }
+}
+
+/// Parse sort_order string from settings to SortOrder enum
+pub fn parse_sort_order(s: &str) -> SortOrder {
+    match s.to_lowercase().as_str() {
+        "desc" => SortOrder::Desc,
+        _ => SortOrder::Asc,
+    }
+}
+
+/// Convert SortBy enum to string for settings
+pub fn sort_by_to_string(sort_by: SortBy) -> String {
+    match sort_by {
+        SortBy::Name => "name".to_string(),
+        SortBy::Type => "type".to_string(),
+        SortBy::Size => "size".to_string(),
+        SortBy::Modified => "modified".to_string(),
+    }
+}
+
+/// Convert SortOrder enum to string for settings
+pub fn sort_order_to_string(sort_order: SortOrder) -> String {
+    match sort_order {
+        SortOrder::Asc => "asc".to_string(),
+        SortOrder::Desc => "desc".to_string(),
+    }
+}
+
 #[derive(Debug)]
 pub struct PanelState {
     pub path: PathBuf,
@@ -287,6 +450,8 @@ pub struct PanelState {
     pub sort_order: SortOrder,
     pub scroll_offset: usize,
     pub pending_focus: Option<String>,
+    pub disk_total: u64,
+    pub disk_available: u64,
 }
 
 impl PanelState {
@@ -304,6 +469,33 @@ impl PanelState {
             sort_order: SortOrder::Asc,
             scroll_offset: 0,
             pending_focus: None,
+            disk_total: 0,
+            disk_available: 0,
+        };
+        state.load_files();
+        state
+    }
+
+    /// Create a PanelState with settings from config
+    pub fn with_settings(path: PathBuf, panel_settings: &crate::config::PanelSettings) -> Self {
+        // Validate path and get a valid one
+        let fallback = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+        let valid_path = get_valid_path(&path, &fallback);
+
+        let sort_by = parse_sort_by(&panel_settings.sort_by);
+        let sort_order = parse_sort_order(&panel_settings.sort_order);
+
+        let mut state = Self {
+            path: valid_path,
+            files: Vec::new(),
+            selected_index: 0,
+            selected_files: HashSet::new(),
+            sort_by,
+            sort_order,
+            scroll_offset: 0,
+            pending_focus: None,
+            disk_total: 0,
+            disk_available: 0,
         };
         state.load_files();
         state
@@ -367,6 +559,19 @@ impl PanelState {
 
                 let cmp = match self.sort_by {
                     SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                    SortBy::Type => {
+                        let ext_a = std::path::Path::new(&a.name)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+                        let ext_b = std::path::Path::new(&b.name)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+                        ext_a.cmp(&ext_b)
+                    }
                     SortBy::Size => a.size.cmp(&b.size),
                     SortBy::Modified => a.modified.cmp(&b.modified),
                 };
@@ -392,6 +597,34 @@ impl PanelState {
         if self.selected_index >= self.files.len() && !self.files.is_empty() {
             self.selected_index = self.files.len() - 1;
         }
+
+        // Update disk info
+        self.update_disk_info();
+    }
+
+    fn update_disk_info(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::ffi::CString;
+            use std::mem::MaybeUninit;
+
+            if let Some(path_str) = self.path.to_str() {
+                if let Ok(c_path) = CString::new(path_str) {
+                    let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
+                    // SAFETY: statvfs is a standard POSIX function, c_path is valid
+                    let result = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
+                    if result == 0 {
+                        // SAFETY: statvfs succeeded, stat is initialized
+                        let stat = unsafe { stat.assume_init() };
+                        self.disk_total = stat.f_blocks as u64 * stat.f_frsize as u64;
+                        self.disk_available = stat.f_bavail as u64 * stat.f_frsize as u64;
+                        return;
+                    }
+                }
+            }
+        }
+        self.disk_total = 0;
+        self.disk_available = 0;
     }
 
     pub fn current_file(&self) -> Option<&FileItem> {
@@ -421,6 +654,12 @@ pub struct App {
     pub dialog: Option<Dialog>,
     pub message: Option<String>,
     pub message_timer: u8,
+
+    // Settings
+    pub settings: Settings,
+
+    // Theme (loaded from settings)
+    pub theme: crate::ui::theme::Theme,
 
     // File viewer state (새로운 고급 상태)
     pub viewer_state: Option<ViewerState>,
@@ -473,10 +712,6 @@ pub struct App {
     // AI screen state
     pub ai_state: Option<crate::ui::ai_screen::AIScreenState>,
 
-    // Saved AI session (for persistence between AI screen visits)
-    pub saved_ai_history: Vec<crate::ui::ai_screen::HistoryItem>,
-    pub saved_ai_session_id: Option<String>,
-
     // System info state
     pub system_info_state: crate::ui::system_info::SystemInfoState,
 
@@ -501,8 +736,26 @@ pub struct App {
     // File operation progress state
     pub file_operation_progress: Option<FileOperationProgress>,
 
+    // Pending tar archive name (for focusing after completion)
+    pub pending_tar_archive: Option<String>,
+
+    // Pending extract directory name (for focusing after completion)
+    pub pending_extract_dir: Option<String>,
+
     // Conflict resolution state for duplicate file handling
     pub conflict_state: Option<ConflictState>,
+
+    // Tar exclude confirmation state
+    pub tar_exclude_state: Option<TarExcludeState>,
+
+    // Copy exclude confirmation state
+    pub copy_exclude_state: Option<CopyExcludeState>,
+
+    // Help screen state
+    pub help_state: HelpState,
+
+    // Settings dialog state
+    pub settings_state: Option<SettingsState>,
 }
 
 impl App {
@@ -515,6 +768,8 @@ impl App {
             dialog: None,
             message: None,
             message_timer: 0,
+            settings: Settings::default(),
+            theme: crate::ui::theme::Theme::default(),
 
             // 새로운 고급 상태
             viewer_state: None,
@@ -547,8 +802,6 @@ impl App {
             process_force_kill: false,
 
             ai_state: None,
-            saved_ai_history: Vec::new(),
-            saved_ai_session_id: None,
             system_info_state: crate::ui::system_info::SystemInfoState::default(),
             advanced_search_state: crate::ui::advanced_search::AdvancedSearchState::default(),
             image_viewer_state: None,
@@ -557,8 +810,212 @@ impl App {
             previous_screen: None,
             clipboard: None,
             file_operation_progress: None,
+            pending_tar_archive: None,
+            pending_extract_dir: None,
             conflict_state: None,
+            tar_exclude_state: None,
+            copy_exclude_state: None,
+            help_state: HelpState::default(),
+            settings_state: None,
         }
+    }
+
+    /// Create App with settings loaded from config file
+    pub fn with_settings(settings: Settings) -> Self {
+        let left_path = settings.left_start_path();
+        let right_path = settings.right_start_path();
+
+        let active_panel = if settings.active_panel.to_lowercase() == "right" {
+            PanelSide::Right
+        } else {
+            PanelSide::Left
+        };
+
+        // Load theme from settings
+        let theme = crate::ui::theme::Theme::load(&settings.theme.name);
+
+        Self {
+            left_panel: PanelState::with_settings(left_path, &settings.left_panel),
+            right_panel: PanelState::with_settings(right_path, &settings.right_panel),
+            active_panel,
+            current_screen: Screen::DualPanel,
+            dialog: None,
+            message: None,
+            message_timer: 0,
+            settings,
+            theme,
+
+            // 새로운 고급 상태
+            viewer_state: None,
+            editor_state: None,
+
+            // 레거시 호환용
+            viewer_lines: Vec::new(),
+            viewer_scroll: 0,
+            viewer_search_term: String::new(),
+            viewer_search_mode: false,
+            viewer_search_input: String::new(),
+            viewer_match_lines: Vec::new(),
+            viewer_current_match: 0,
+
+            editor_lines: vec![String::new()],
+            editor_cursor_line: 0,
+            editor_cursor_col: 0,
+            editor_scroll: 0,
+            editor_modified: false,
+            editor_file_path: PathBuf::new(),
+
+            info_file_path: PathBuf::new(),
+            file_info_state: None,
+
+            processes: Vec::new(),
+            process_selected_index: 0,
+            process_sort_field: crate::services::process::SortField::Cpu,
+            process_sort_asc: false,
+            process_confirm_kill: None,
+            process_force_kill: false,
+
+            ai_state: None,
+            system_info_state: crate::ui::system_info::SystemInfoState::default(),
+            advanced_search_state: crate::ui::advanced_search::AdvancedSearchState::default(),
+            image_viewer_state: None,
+            pending_large_image: None,
+            search_result_state: crate::ui::search_result::SearchResultState::default(),
+            previous_screen: None,
+            clipboard: None,
+            file_operation_progress: None,
+            pending_tar_archive: None,
+            pending_extract_dir: None,
+            conflict_state: None,
+            tar_exclude_state: None,
+            copy_exclude_state: None,
+            help_state: HelpState::default(),
+            settings_state: None,
+        }
+    }
+
+    /// Save current settings to config file
+    pub fn save_settings(&mut self) {
+        use crate::config::PanelSettings;
+
+        // Update settings from current state
+        self.settings.left_panel = PanelSettings {
+            start_path: Some(self.left_panel.path.display().to_string()),
+            sort_by: sort_by_to_string(self.left_panel.sort_by),
+            sort_order: sort_order_to_string(self.left_panel.sort_order),
+        };
+
+        self.settings.right_panel = PanelSettings {
+            start_path: Some(self.right_panel.path.display().to_string()),
+            sort_by: sort_by_to_string(self.right_panel.sort_by),
+            sort_order: sort_order_to_string(self.right_panel.sort_order),
+        };
+
+        self.settings.active_panel = match self.active_panel {
+            PanelSide::Left => "left".to_string(),
+            PanelSide::Right => "right".to_string(),
+        };
+
+        // Save to file (ignore errors silently)
+        let _ = self.settings.save();
+    }
+
+    /// Reload settings from config file and apply theme
+    /// Called when settings.json is edited within the app
+    /// Returns true on success, false on error (with error message shown)
+    pub fn reload_settings(&mut self) -> bool {
+        let new_settings = match Settings::load_with_error() {
+            Ok(s) => s,
+            Err(e) => {
+                self.show_message(&format!("Settings error: {}", e));
+                return false;
+            }
+        };
+
+        // Reload theme if name changed
+        if new_settings.theme.name != self.settings.theme.name {
+            self.theme = crate::ui::theme::Theme::load(&new_settings.theme.name);
+        }
+
+        // Apply panel sort settings (keep current paths and selection)
+        let left_sort_by = parse_sort_by(&new_settings.left_panel.sort_by);
+        let left_sort_order = parse_sort_order(&new_settings.left_panel.sort_order);
+        if self.left_panel.sort_by != left_sort_by || self.left_panel.sort_order != left_sort_order {
+            self.left_panel.sort_by = left_sort_by;
+            self.left_panel.sort_order = left_sort_order;
+            self.left_panel.load_files();
+        }
+
+        let right_sort_by = parse_sort_by(&new_settings.right_panel.sort_by);
+        let right_sort_order = parse_sort_order(&new_settings.right_panel.sort_order);
+        if self.right_panel.sort_by != right_sort_by || self.right_panel.sort_order != right_sort_order {
+            self.right_panel.sort_by = right_sort_by;
+            self.right_panel.sort_order = right_sort_order;
+            self.right_panel.load_files();
+        }
+
+        // Update active panel setting
+        self.settings.active_panel = new_settings.active_panel;
+
+        // Update tar_path setting
+        self.settings.tar_path = new_settings.tar_path;
+
+        // Update settings
+        self.settings.theme = new_settings.theme;
+        self.settings.left_panel = new_settings.left_panel;
+        self.settings.right_panel = new_settings.right_panel;
+
+        true
+    }
+
+    /// Check if a path is the settings.json file
+    pub fn is_settings_file(path: &std::path::Path) -> bool {
+        if let Some(config_path) = Settings::config_path() {
+            path == config_path
+        } else {
+            false
+        }
+    }
+
+    /// Show settings dialog
+    pub fn show_settings_dialog(&mut self) {
+        self.settings_state = Some(SettingsState::new(&self.settings));
+        self.dialog = Some(Dialog {
+            dialog_type: DialogType::Settings,
+            input: String::new(),
+            cursor_pos: 0,
+            message: String::new(),
+            completion: None,
+            selected_button: 0,
+        });
+    }
+
+    /// Apply settings from dialog and save
+    pub fn apply_settings_from_dialog(&mut self) {
+        if let Some(ref state) = self.settings_state {
+            let new_theme_name = state.current_theme().to_string();
+
+            // Update theme if changed
+            if new_theme_name != self.settings.theme.name {
+                self.settings.theme.name = new_theme_name.clone();
+                self.theme = crate::ui::theme::Theme::load(&new_theme_name);
+            }
+
+            // Save settings
+            let _ = self.settings.save();
+            self.show_message("Settings saved!");
+        }
+
+        self.settings_state = None;
+        self.dialog = None;
+    }
+
+    /// Cancel settings dialog and restore original theme
+    pub fn cancel_settings_dialog(&mut self) {
+        // Restore original theme if it was changed during preview
+        self.theme = crate::ui::theme::Theme::load(&self.settings.theme.name);
+        self.settings_state = None;
+        self.dialog = None;
     }
 
     pub fn active_panel_mut(&mut self) -> &mut PanelState {
@@ -583,6 +1040,9 @@ impl App {
     }
 
     pub fn switch_panel(&mut self) {
+        // 현재 패널의 선택 해제
+        self.active_panel_mut().selected_files.clear();
+
         self.active_panel = match self.active_panel {
             PanelSide::Left => PanelSide::Right,
             PanelSide::Right => PanelSide::Left,
@@ -595,6 +1055,9 @@ impl App {
         let current_scroll = self.active_panel().scroll_offset;
         let current_index = self.active_panel().selected_index;
         let relative_pos = current_index.saturating_sub(current_scroll);
+
+        // 현재 패널의 선택 해제
+        self.active_panel_mut().selected_files.clear();
 
         // 패널 전환
         self.active_panel = match self.active_panel {
@@ -654,11 +1117,27 @@ impl App {
                     panel.selected_files.clear();
                     panel.load_files();
                 }
+            } else if Self::is_archive_file(&file.name) {
+                // It's an archive file - extract it
+                let archive_path = panel.path.join(&file.name);
+                self.execute_untar(&archive_path);
             } else {
-                // It's a file - open viewer (text or image)
-                self.view_file()
+                // It's a file - open editor
+                self.edit_file()
             }
         }
+    }
+
+    /// Check if a file is a supported archive format
+    fn is_archive_file(filename: &str) -> bool {
+        let lower = filename.to_lowercase();
+        lower.ends_with(".tar")
+            || lower.ends_with(".tar.gz")
+            || lower.ends_with(".tgz")
+            || lower.ends_with(".tar.bz2")
+            || lower.ends_with(".tbz2")
+            || lower.ends_with(".tar.xz")
+            || lower.ends_with(".txz")
     }
 
     pub fn go_to_parent(&mut self) {
@@ -668,6 +1147,17 @@ impl App {
         }
         if let Some(parent) = panel.path.parent() {
             panel.path = parent.to_path_buf();
+            panel.selected_index = 0;
+            panel.selected_files.clear();
+            panel.load_files();
+        }
+    }
+
+    /// 홈 디렉토리로 이동
+    pub fn goto_home(&mut self) {
+        if let Some(home) = dirs::home_dir() {
+            let panel = self.active_panel_mut();
+            panel.path = home;
             panel.selected_index = 0;
             panel.selected_files.clear();
             panel.load_files();
@@ -706,6 +1196,51 @@ impl App {
         }
     }
 
+    pub fn select_by_extension(&mut self) {
+        let panel = self.active_panel_mut();
+        if let Some(current_file) = panel.files.get(panel.selected_index) {
+            // Get extension of current file
+            let target_ext = std::path::Path::new(&current_file.name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase());
+
+            if let Some(ext) = target_ext {
+                // Collect files with same extension
+                let matching_files: Vec<String> = panel.files.iter()
+                    .filter(|f| f.name != ".." && !f.is_directory)
+                    .filter(|f| {
+                        std::path::Path::new(&f.name)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .map(|e| e.to_lowercase())
+                            .as_ref() == Some(&ext)
+                    })
+                    .map(|f| f.name.clone())
+                    .collect();
+
+                // Check if all matching files are already selected
+                let all_selected = matching_files.iter()
+                    .all(|name| panel.selected_files.contains(name));
+
+                let count = matching_files.len();
+                if all_selected {
+                    // Deselect all matching files
+                    for name in matching_files {
+                        panel.selected_files.remove(&name);
+                    }
+                    self.show_message(&format!("Deselected {} .{} file(s)", count, ext));
+                } else {
+                    // Select all matching files
+                    for name in matching_files {
+                        panel.selected_files.insert(name);
+                    }
+                    self.show_message(&format!("Selected {} .{} file(s)", count, ext));
+                }
+            }
+        }
+    }
+
     pub fn toggle_sort_by_name(&mut self) {
         self.active_panel_mut().toggle_sort(SortBy::Name);
     }
@@ -716,6 +1251,10 @@ impl App {
 
     pub fn toggle_sort_by_date(&mut self) {
         self.active_panel_mut().toggle_sort(SortBy::Modified);
+    }
+
+    pub fn toggle_sort_by_type(&mut self) {
+        self.active_panel_mut().toggle_sort(SortBy::Type);
     }
 
     pub fn show_message(&mut self, msg: &str) {
@@ -742,6 +1281,48 @@ impl App {
             }
         } else {
             Vec::new()
+        }
+    }
+
+    /// Calculate total size and build file size map for tar progress
+    fn calculate_tar_sizes(base_dir: &Path, files: &[String]) -> (u64, std::collections::HashMap<String, u64>) {
+        use std::collections::HashMap;
+        let mut total_size = 0u64;
+        let mut size_map = HashMap::new();
+
+        for file in files {
+            let path = base_dir.join(file);
+            Self::collect_file_sizes(&path, &format!("./{}", file), &mut size_map, &mut total_size);
+        }
+
+        (total_size, size_map)
+    }
+
+    /// Collect file sizes recursively, matching tar's output format
+    fn collect_file_sizes(
+        path: &Path,
+        tar_path: &str,
+        size_map: &mut std::collections::HashMap<String, u64>,
+        total_size: &mut u64,
+    ) {
+        if let Ok(metadata) = std::fs::symlink_metadata(path) {
+            if metadata.is_dir() {
+                // Directory itself (tar lists directories too)
+                size_map.insert(tar_path.to_string(), 0);
+
+                if let Ok(entries) = std::fs::read_dir(path) {
+                    for entry in entries.filter_map(|e| e.ok()) {
+                        let entry_name = entry.file_name().to_string_lossy().to_string();
+                        let child_tar_path = format!("{}/{}", tar_path, entry_name);
+                        Self::collect_file_sizes(&entry.path(), &child_tar_path, size_map, total_size);
+                    }
+                }
+            } else {
+                // Regular file or symlink
+                let size = metadata.len();
+                size_map.insert(tar_path.to_string(), size);
+                *total_size += size;
+            }
         }
     }
 
@@ -885,7 +1466,12 @@ impl App {
         } else {
             format!("{} and {} more", files[..2].join(", "), files.len() - 2)
         };
-        let target = format!("{}/", self.target_panel().path.display());
+        let path_str = self.target_panel().path.display().to_string();
+        let target = if path_str.ends_with('/') {
+            path_str
+        } else {
+            format!("{}/", path_str)
+        };
         let cursor_pos = target.chars().count();
         self.dialog = Some(Dialog {
             dialog_type: DialogType::Copy,
@@ -908,7 +1494,12 @@ impl App {
         } else {
             format!("{} and {} more", files[..2].join(", "), files.len() - 2)
         };
-        let target = format!("{}/", self.target_panel().path.display());
+        let path_str = self.target_panel().path.display().to_string();
+        let target = if path_str.ends_with('/') {
+            path_str
+        } else {
+            format!("{}/", path_str)
+        };
         let cursor_pos = target.chars().count();
         self.dialog = Some(Dialog {
             dialog_type: DialogType::Move,
@@ -971,6 +1562,34 @@ impl App {
         }
     }
 
+    pub fn show_tar_dialog(&mut self) {
+        let files = self.get_operation_files();
+        if files.is_empty() {
+            self.show_message("No files selected");
+            return;
+        }
+
+        // Generate default archive name based on first file
+        let first_file = &files[0];
+        let archive_name = format!("{}.tar.gz", first_file);
+
+        let file_list = if files.len() <= 3 {
+            files.join(", ")
+        } else {
+            format!("{} and {} more", files[..2].join(", "), files.len() - 2)
+        };
+
+        let cursor_pos = archive_name.chars().count();
+        self.dialog = Some(Dialog {
+            dialog_type: DialogType::Tar,
+            input: archive_name,
+            cursor_pos,
+            message: file_list,
+            completion: None,
+            selected_button: 0,
+        });
+    }
+
     pub fn show_search_dialog(&mut self) {
         self.dialog = Some(Dialog {
             dialog_type: DialogType::Search,
@@ -1003,27 +1622,27 @@ impl App {
     }
 
     pub fn show_ai_screen(&mut self) {
+        use std::process::Command;
+
+        // Check if claude command is available
+        let claude_available = Command::new("claude")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if !claude_available {
+            self.show_message("Claude CLI not found. Please install claude command.");
+            return;
+        }
+
         let current_path = self.active_panel().path.display().to_string();
-
-        // Restore saved session if available
-        if !self.saved_ai_history.is_empty() || self.saved_ai_session_id.is_some() {
-            self.ai_state = Some(crate::ui::ai_screen::AIScreenState::with_session(
-                current_path,
-                std::mem::take(&mut self.saved_ai_history),
-                self.saved_ai_session_id.take(),
-            ));
-        } else {
-            self.ai_state = Some(crate::ui::ai_screen::AIScreenState::new(current_path));
-        }
+        // Try to load the most recent session, fall back to new session
+        self.ai_state = Some(
+            crate::ui::ai_screen::AIScreenState::load_latest_session(current_path.clone())
+                .unwrap_or_else(|| crate::ui::ai_screen::AIScreenState::new(current_path))
+        );
         self.current_screen = Screen::AIScreen;
-    }
-
-    /// Save AI session state before leaving AI screen
-    pub fn save_ai_session(&mut self) {
-        if let Some(ref state) = self.ai_state {
-            self.saved_ai_history = state.history.clone();
-            self.saved_ai_session_id = state.session_id.clone();
-        }
     }
 
     pub fn show_system_info(&mut self) {
@@ -1097,8 +1716,67 @@ impl App {
         self.refresh_panels();
     }
 
-    /// Execute copy with progress dialog
+    /// Execute copy with progress dialog (with sensitive symlink check and conflict detection)
     pub fn execute_copy_to_with_progress(&mut self, target_path: &Path) {
+        let files = self.get_operation_files();
+        if files.is_empty() {
+            self.show_message("No files selected");
+            return;
+        }
+
+        let source_path = self.active_panel().path.clone();
+
+        // Check for sensitive symlinks
+        let sensitive_symlinks = file_ops::filter_sensitive_symlinks_for_copy(&source_path, &files);
+
+        if !sensitive_symlinks.is_empty() {
+            // Show confirmation dialog
+            self.copy_exclude_state = Some(CopyExcludeState {
+                target_path: target_path.to_path_buf(),
+                excluded_paths: sensitive_symlinks,
+                scroll_offset: 0,
+                is_move: false,
+            });
+            self.dialog = Some(Dialog {
+                dialog_type: DialogType::CopyExcludeConfirm,
+                input: String::new(),
+                cursor_pos: 0,
+                message: String::new(),
+                completion: None,
+                selected_button: 0,
+            });
+            return;
+        }
+
+        // Detect conflicts (files that already exist at destination)
+        let conflicts = self.detect_operation_conflicts(&source_path, target_path, &files);
+
+        if !conflicts.is_empty() {
+            // Create temporary clipboard for conflict resolution
+            let clipboard = Clipboard {
+                files: files.clone(),
+                source_path: source_path.clone(),
+                operation: ClipboardOperation::Copy,
+            };
+            self.conflict_state = Some(ConflictState {
+                conflicts,
+                current_index: 0,
+                files_to_overwrite: Vec::new(),
+                files_to_skip: Vec::new(),
+                clipboard_backup: Some(clipboard),
+                is_move_operation: false,
+                target_path: target_path.to_path_buf(),
+            });
+            self.show_duplicate_conflict_dialog();
+            return;
+        }
+
+        // No conflicts - proceed directly
+        self.execute_copy_to_with_progress_internal(target_path);
+    }
+
+    /// Execute copy with progress dialog (internal - no symlink check)
+    pub fn execute_copy_to_with_progress_internal(&mut self, target_path: &Path) {
         let files = self.get_operation_files();
         if files.is_empty() {
             self.show_message("No files selected");
@@ -1175,8 +1853,67 @@ impl App {
         self.refresh_panels();
     }
 
-    /// Execute move with progress dialog
+    /// Execute move with progress dialog (with sensitive symlink check)
     pub fn execute_move_to_with_progress(&mut self, target_path: &Path) {
+        let files = self.get_operation_files();
+        if files.is_empty() {
+            self.show_message("No files selected");
+            return;
+        }
+
+        let source_path = self.active_panel().path.clone();
+
+        // Check for sensitive symlinks
+        let sensitive_symlinks = file_ops::filter_sensitive_symlinks_for_copy(&source_path, &files);
+
+        if !sensitive_symlinks.is_empty() {
+            // Show confirmation dialog
+            self.copy_exclude_state = Some(CopyExcludeState {
+                target_path: target_path.to_path_buf(),
+                excluded_paths: sensitive_symlinks,
+                scroll_offset: 0,
+                is_move: true,
+            });
+            self.dialog = Some(Dialog {
+                dialog_type: DialogType::CopyExcludeConfirm,
+                input: String::new(),
+                cursor_pos: 0,
+                message: String::new(),
+                completion: None,
+                selected_button: 0,
+            });
+            return;
+        }
+
+        // Detect conflicts (files that already exist at destination)
+        let conflicts = self.detect_operation_conflicts(&source_path, target_path, &files);
+
+        if !conflicts.is_empty() {
+            // Create temporary clipboard for conflict resolution
+            let clipboard = Clipboard {
+                files: files.clone(),
+                source_path: source_path.clone(),
+                operation: ClipboardOperation::Cut,
+            };
+            self.conflict_state = Some(ConflictState {
+                conflicts,
+                current_index: 0,
+                files_to_overwrite: Vec::new(),
+                files_to_skip: Vec::new(),
+                clipboard_backup: Some(clipboard),
+                is_move_operation: true,
+                target_path: target_path.to_path_buf(),
+            });
+            self.show_duplicate_conflict_dialog();
+            return;
+        }
+
+        // No conflicts - proceed directly
+        self.execute_move_to_with_progress_internal(target_path);
+    }
+
+    /// Execute move with progress dialog (internal - no symlink check)
+    pub fn execute_move_to_with_progress_internal(&mut self, target_path: &Path) {
         let files = self.get_operation_files();
         if files.is_empty() {
             self.show_message("No files selected");
@@ -1361,6 +2098,7 @@ impl App {
                 files_to_skip: Vec::new(),
                 clipboard_backup: Some(clipboard),
                 is_move_operation: is_move,
+                target_path: target_path.clone(),
             });
             self.show_duplicate_conflict_dialog();
             return;
@@ -1381,6 +2119,27 @@ impl App {
 
         for file_name in valid_files {
             let src = clipboard.source_path.join(file_name);
+            let dest = target_dir.join(file_name);
+
+            if dest.exists() {
+                conflicts.push((src, dest, file_name.clone()));
+            }
+        }
+
+        conflicts
+    }
+
+    /// Detect files that would conflict (already exist) at copy/move destination
+    fn detect_operation_conflicts(
+        &self,
+        source_dir: &Path,
+        target_dir: &Path,
+        files: &[String],
+    ) -> Vec<(PathBuf, PathBuf, String)> {
+        let mut conflicts = Vec::new();
+
+        for file_name in files {
+            let src = source_dir.join(file_name);
             let dest = target_dir.join(file_name);
 
             if dest.exists() {
@@ -1483,7 +2242,7 @@ impl App {
             None => return,
         };
 
-        let target_path = self.active_panel().path.clone();
+        let target_path = conflict_state.target_path;
 
         // Build all files to process (from original clipboard)
         let valid_files: Vec<String> = clipboard.files.clone();
@@ -1671,6 +2430,705 @@ impl App {
         }
     }
 
+    pub fn execute_tar(&mut self, archive_name: &str) {
+        // Fast validations only (no I/O or external processes)
+        if let Err(e) = file_ops::is_valid_filename(archive_name) {
+            self.show_message(&format!("Error: {}", e));
+            return;
+        }
+
+        let files = self.get_operation_files();
+        if files.is_empty() {
+            self.show_message("No files to archive");
+            return;
+        }
+
+        // Validate each filename to prevent argument injection
+        for file in &files {
+            if let Err(e) = file_ops::is_valid_filename(file) {
+                self.show_message(&format!("Invalid filename '{}': {}", file, e));
+                return;
+            }
+        }
+
+        let current_dir = self.active_panel().path.clone();
+        let archive_path = current_dir.join(archive_name);
+
+        // Check if archive already exists (fast check)
+        if archive_path.exists() {
+            self.show_message(&format!("Error: {} already exists", archive_name));
+            return;
+        }
+
+        // Check for unsafe symlinks BEFORE starting background work
+        let (_, excluded_paths) = file_ops::filter_symlinks_for_tar(&current_dir, &files);
+
+        // If there are files to exclude, show confirmation dialog
+        if !excluded_paths.is_empty() {
+            self.tar_exclude_state = Some(TarExcludeState {
+                archive_name: archive_name.to_string(),
+                files: files.clone(),
+                excluded_paths,
+                scroll_offset: 0,
+            });
+            self.dialog = Some(Dialog {
+                dialog_type: DialogType::TarExcludeConfirm,
+                input: String::new(),
+                cursor_pos: 0,
+                message: String::new(),
+                completion: None,
+                selected_button: 0,
+            });
+            return;
+        }
+
+        // No exclusions needed - proceed directly
+        self.execute_tar_with_excludes(archive_name, &files, &[]);
+    }
+
+    /// Execute tar with specified exclusions (called after confirmation or when no exclusions needed)
+    pub fn execute_tar_with_excludes(&mut self, archive_name: &str, files: &[String], excluded_paths: &[String]) {
+        use std::process::{Command, Stdio};
+        use std::io::BufReader;
+
+        let current_dir = self.active_panel().path.clone();
+
+        // Determine compression option based on extension
+        let tar_options = if archive_name.ends_with(".tar.gz") || archive_name.ends_with(".tgz") {
+            "cvfpz"
+        } else if archive_name.ends_with(".tar.bz2") || archive_name.ends_with(".tbz2") {
+            "cvfpj"
+        } else if archive_name.ends_with(".tar.xz") || archive_name.ends_with(".txz") {
+            "cvfpJ"
+        } else {
+            "cvfp"
+        };
+
+        let tar_options_owned = tar_options.to_string();
+        let archive_name_owned = archive_name.to_string();
+        let archive_path_clone = current_dir.join(archive_name);
+        let files_owned = files.to_vec();
+        let excluded_owned = excluded_paths.to_vec();
+
+        // Create progress state with preparing flag - show dialog immediately
+        let mut progress = FileOperationProgress::new(FileOperationType::Tar);
+        progress.is_active = true;
+        progress.is_preparing = true;
+        progress.preparing_message = "Preparing...".to_string();
+        let cancel_flag = progress.cancel_flag.clone();
+
+        // Create channel for progress messages
+        let (tx, rx) = mpsc::channel();
+        progress.receiver = Some(rx);
+
+        // Clear selection before starting
+        self.active_panel_mut().selected_files.clear();
+
+        // Store progress state and show dialog IMMEDIATELY
+        self.file_operation_progress = Some(progress);
+        self.pending_tar_archive = Some(archive_name.to_string());
+        self.dialog = Some(Dialog {
+            dialog_type: DialogType::Progress,
+            input: String::new(),
+            cursor_pos: 0,
+            message: String::new(),
+            completion: None,
+            selected_button: 0,
+        });
+
+        // Clone tar_path from settings for use in background thread
+        let tar_path = self.settings.tar_path.clone();
+
+        // Start all preparation and execution in background thread
+        thread::spawn(move || {
+            // Check for cancellation
+            if cancel_flag.load(Ordering::Relaxed) {
+                let _ = tx.send(ProgressMessage::Error(archive_name_owned, "Cancelled".to_string()));
+                let _ = tx.send(ProgressMessage::Completed(0, 1));
+                return;
+            }
+
+            // Build tar_args with --exclude options for unsafe symlinks
+            // Note: archive name must come right after options (e.g., cvfpz archive.tar.gz)
+            let mut tar_args = vec![tar_options_owned.clone(), archive_name_owned.clone()];
+            for excluded in &excluded_owned {
+                tar_args.push(format!("--exclude=./{}", excluded));
+            }
+            tar_args.extend(files_owned.iter().map(|f| format!("./{}", f)));
+
+            // Check for cancellation
+            if cancel_flag.load(Ordering::Relaxed) {
+                let _ = tx.send(ProgressMessage::Error(archive_name_owned, "Cancelled".to_string()));
+                let _ = tx.send(ProgressMessage::Completed(0, 1));
+                return;
+            }
+
+            // Determine tar command (in background)
+            let _ = tx.send(ProgressMessage::Preparing("Checking tar command...".to_string()));
+            let tar_cmd = if let Some(ref custom_tar) = tar_path {
+                // Use custom tar path from settings
+                match Command::new(custom_tar).arg("--version").output() {
+                    Ok(output) if output.status.success() => Some(custom_tar.clone()),
+                    _ => None,
+                }
+            } else {
+                // Default: try gtar first, then tar
+                match Command::new("gtar").arg("--version").output() {
+                    Ok(output) if output.status.success() => Some("gtar".to_string()),
+                    _ => match Command::new("tar").arg("--version").output() {
+                        Ok(output) if output.status.success() => Some("tar".to_string()),
+                        _ => None,
+                    },
+                }
+            };
+
+            let tar_cmd = match tar_cmd {
+                Some(cmd) => cmd,
+                None => {
+                    let _ = tx.send(ProgressMessage::Error(archive_name_owned, "tar command not found".to_string()));
+                    let _ = tx.send(ProgressMessage::Completed(0, 1));
+                    return;
+                }
+            };
+
+            // Check if stdbuf is available (in background)
+            let has_stdbuf = Command::new("stdbuf").arg("--version").output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+
+            // Check for cancellation
+            if cancel_flag.load(Ordering::Relaxed) {
+                let _ = tx.send(ProgressMessage::Error(archive_name_owned, "Cancelled".to_string()));
+                let _ = tx.send(ProgressMessage::Completed(0, 1));
+                return;
+            }
+
+            // Calculate file sizes
+            let _ = tx.send(ProgressMessage::Preparing("Calculating file sizes...".to_string()));
+
+            // Check for cancellation during preparation
+            if cancel_flag.load(Ordering::Relaxed) {
+                let _ = tx.send(ProgressMessage::Error(archive_name_owned, "Cancelled".to_string()));
+                let _ = tx.send(ProgressMessage::Completed(0, 1));
+                return;
+            }
+
+            // Calculate total size and file size map (in background)
+            let (total_bytes, size_map) = Self::calculate_tar_sizes(&current_dir, &files_owned);
+            let total_file_count = size_map.len();
+
+            // Check for cancellation after preparation
+            if cancel_flag.load(Ordering::Relaxed) {
+                let _ = tx.send(ProgressMessage::Error(archive_name_owned, "Cancelled".to_string()));
+                let _ = tx.send(ProgressMessage::Completed(0, 1));
+                return;
+            }
+
+            // Preparation complete, send initial totals
+            let _ = tx.send(ProgressMessage::PrepareComplete);
+            let _ = tx.send(ProgressMessage::TotalProgress(0, total_file_count, 0, total_bytes));
+
+            // Helper function to cleanup partial archive
+            let cleanup_archive = |path: &PathBuf| {
+                let _ = std::fs::remove_file(path);
+            };
+
+            // Use stdbuf to disable buffering if available
+            let child = if has_stdbuf {
+                let mut args = vec!["-o0".to_string(), "-e0".to_string(), tar_cmd.clone()];
+                args.extend(tar_args);
+                Command::new("stdbuf")
+                    .current_dir(&current_dir)
+                    .args(&args)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+            } else {
+                Command::new(&tar_cmd)
+                    .current_dir(&current_dir)
+                    .args(&tar_args)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+            };
+
+            match child {
+                Ok(mut child) => {
+                    let stdout = child.stdout.take();
+                    let stderr = child.stderr.take();
+                    let mut completed_files = 0usize;
+                    let mut completed_bytes = 0u64;
+                    let mut last_error_line: Option<String> = None;
+
+                    // Collect stderr in background for error messages
+                    let stderr_handle = stderr.map(|stderr| {
+                        thread::spawn(move || {
+                            use std::io::Read;
+                            let mut err_str = String::new();
+                            let mut stderr = stderr;
+                            let _ = stderr.read_to_string(&mut err_str);
+                            err_str
+                        })
+                    });
+
+                    // Read stdout line by line for progress updates
+                    // (tar outputs verbose listing to stdout on most systems)
+                    if let Some(stdout) = stdout {
+                        use std::io::BufRead;
+                        let mut reader = BufReader::with_capacity(64, stdout);
+                        let mut line = String::new();
+
+                        loop {
+                            // Check for cancellation
+                            if cancel_flag.load(Ordering::Relaxed) {
+                                let _ = child.kill();
+                                // Cleanup partial archive on cancellation
+                                cleanup_archive(&archive_path_clone);
+                                let _ = tx.send(ProgressMessage::Error(
+                                    archive_name_owned.clone(),
+                                    "Cancelled".to_string(),
+                                ));
+                                let _ = tx.send(ProgressMessage::Completed(completed_files, 1));
+                                return;
+                            }
+
+                            line.clear();
+                            match reader.read_line(&mut line) {
+                                Ok(0) => break, // EOF
+                                Ok(_) => {
+                                    let filename = line.trim_end();
+                                    // Check if this looks like an error line (starts with "tar:")
+                                    if filename.starts_with("tar:") || filename.starts_with("gtar:") {
+                                        last_error_line = Some(filename.to_string());
+                                    } else if !filename.is_empty() {
+                                        completed_files += 1;
+                                        // Look up file size from the map
+                                        if let Some(&file_size) = size_map.get(filename) {
+                                            completed_bytes += file_size;
+                                        }
+                                        let _ = tx.send(ProgressMessage::FileStarted(filename.to_string()));
+                                        let _ = tx.send(ProgressMessage::FileCompleted(filename.to_string()));
+                                        let _ = tx.send(ProgressMessage::TotalProgress(
+                                            completed_files,
+                                            total_file_count,
+                                            completed_bytes,
+                                            total_bytes,
+                                        ));
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+
+                    // Wait for completion
+                    match child.wait() {
+                        Ok(status) => {
+                            if status.success() {
+                                let _ = tx.send(ProgressMessage::Completed(completed_files, 0));
+                            } else {
+                                // Cleanup partial archive on failure
+                                cleanup_archive(&archive_path_clone);
+                                // Get error from stderr or last_error_line
+                                let error_msg = last_error_line
+                                    .or_else(|| {
+                                        stderr_handle
+                                            .and_then(|h| h.join().ok())
+                                            .filter(|s| !s.trim().is_empty())
+                                            .map(|s| s.lines().next().unwrap_or("tar command failed").to_string())
+                                    })
+                                    .unwrap_or_else(|| "tar command failed".to_string());
+                                let _ = tx.send(ProgressMessage::Error(
+                                    archive_name_owned,
+                                    error_msg,
+                                ));
+                                let _ = tx.send(ProgressMessage::Completed(0, 1));
+                            }
+                        }
+                        Err(e) => {
+                            // Cleanup partial archive on error
+                            cleanup_archive(&archive_path_clone);
+                            let _ = tx.send(ProgressMessage::Error(
+                                archive_name_owned,
+                                e.to_string(),
+                            ));
+                            let _ = tx.send(ProgressMessage::Completed(0, 1));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(ProgressMessage::Error(
+                        archive_name_owned,
+                        format!("Failed to run tar: {}", e),
+                    ));
+                    let _ = tx.send(ProgressMessage::Completed(0, 1));
+                }
+            }
+        });
+    }
+
+    /// List archive contents to get total file count and sizes
+    fn list_archive_contents(
+        tar_cmd: &str,
+        archive_path: &std::path::Path,
+        archive_name: &str,
+    ) -> (usize, u64, std::collections::HashMap<String, u64>) {
+        use std::process::Command;
+        use std::collections::HashMap;
+
+        // Determine list option based on extension
+        let list_options = if archive_name.ends_with(".tar.gz") || archive_name.ends_with(".tgz") {
+            "tvfz"
+        } else if archive_name.ends_with(".tar.bz2") || archive_name.ends_with(".tbz2") {
+            "tvfj"
+        } else if archive_name.ends_with(".tar.xz") || archive_name.ends_with(".txz") {
+            "tvfJ"
+        } else {
+            "tvf"
+        };
+
+        let output = Command::new(tar_cmd)
+            .args(&[list_options, &archive_path.to_string_lossy()])
+            .output();
+
+        let mut total_files = 0usize;
+        let mut total_bytes = 0u64;
+        let mut size_map = HashMap::new();
+
+        if let Ok(output) = output {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    // tar -tvf output format: -rw-r--r-- user/group    1234 2024-01-01 12:00 filename
+                    // Parse the line to extract size and filename
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 6 {
+                        // Size is typically the 3rd field (index 2)
+                        if let Ok(size) = parts[2].parse::<u64>() {
+                            // Filename is everything after the date/time (index 5+)
+                            let filename = parts[5..].join(" ");
+                            size_map.insert(filename, size);
+                            total_bytes += size;
+                        }
+                        total_files += 1;
+                    }
+                }
+            }
+        }
+
+        (total_files, total_bytes, size_map)
+    }
+
+    /// Execute archive extraction with progress display
+    pub fn execute_untar(&mut self, archive_path: &std::path::Path) {
+        use std::process::{Command, Stdio};
+        use std::io::BufReader;
+
+        let archive_name = match archive_path.file_name() {
+            Some(name) => name.to_string_lossy().to_string(),
+            None => {
+                self.show_message("Invalid archive path");
+                return;
+            }
+        };
+
+        // Fast validations only
+        if !archive_path.exists() {
+            self.show_message(&format!("Archive not found: {}", archive_name));
+            return;
+        }
+
+        let current_dir = match archive_path.parent() {
+            Some(dir) => dir.to_path_buf(),
+            None => {
+                self.show_message("Invalid archive path");
+                return;
+            }
+        };
+
+        // Determine extraction directory name (remove archive extensions)
+        let extract_dir_name = archive_name
+            .trim_end_matches(".tar.gz")
+            .trim_end_matches(".tgz")
+            .trim_end_matches(".tar.bz2")
+            .trim_end_matches(".tbz2")
+            .trim_end_matches(".tar.xz")
+            .trim_end_matches(".txz")
+            .trim_end_matches(".tar")
+            .to_string();
+
+        let extract_path = current_dir.join(&extract_dir_name);
+
+        // Check if extraction directory already exists (fast check)
+        if extract_path.exists() {
+            self.show_message(&format!("Error: {} already exists", extract_dir_name));
+            return;
+        }
+
+        // Determine decompression option based on extension
+        let tar_options = if archive_name.ends_with(".tar.gz") || archive_name.ends_with(".tgz") {
+            "xvfpz"
+        } else if archive_name.ends_with(".tar.bz2") || archive_name.ends_with(".tbz2") {
+            "xvfpj"
+        } else if archive_name.ends_with(".tar.xz") || archive_name.ends_with(".txz") {
+            "xvfpJ"
+        } else {
+            "xvfp"
+        };
+
+        let archive_path_owned = archive_path.to_path_buf();
+        let archive_name_owned = archive_name.clone();
+        let extract_dir_owned = extract_dir_name.clone();
+        let extract_path_clone = extract_path.clone();
+
+        // Create progress state with preparing flag - show dialog immediately
+        let mut progress = FileOperationProgress::new(FileOperationType::Untar);
+        progress.is_active = true;
+        progress.is_preparing = true;
+        progress.preparing_message = "Preparing...".to_string();
+        let cancel_flag = progress.cancel_flag.clone();
+
+        // Create channel for progress messages
+        let (tx, rx) = mpsc::channel();
+        progress.receiver = Some(rx);
+
+        // Store progress state and show dialog IMMEDIATELY
+        self.file_operation_progress = Some(progress);
+        self.pending_extract_dir = Some(extract_dir_name);
+        self.dialog = Some(Dialog {
+            dialog_type: DialogType::Progress,
+            input: String::new(),
+            cursor_pos: 0,
+            message: String::new(),
+            completion: None,
+            selected_button: 0,
+        });
+
+        // Clone tar_path from settings for use in background thread
+        let tar_path = self.settings.tar_path.clone();
+
+        // Start all preparation and execution in background thread
+        thread::spawn(move || {
+            // Check for cancellation
+            if cancel_flag.load(Ordering::Relaxed) {
+                let _ = tx.send(ProgressMessage::Error(extract_dir_owned, "Cancelled".to_string()));
+                let _ = tx.send(ProgressMessage::Completed(0, 1));
+                return;
+            }
+
+            // Determine tar command (in background)
+            let _ = tx.send(ProgressMessage::Preparing("Checking tar command...".to_string()));
+            let tar_cmd = if let Some(ref custom_tar) = tar_path {
+                // Use custom tar path from settings
+                match Command::new(custom_tar).arg("--version").output() {
+                    Ok(output) if output.status.success() => Some(custom_tar.clone()),
+                    _ => None,
+                }
+            } else {
+                // Default: try gtar first, then tar
+                match Command::new("gtar").arg("--version").output() {
+                    Ok(output) if output.status.success() => Some("gtar".to_string()),
+                    _ => match Command::new("tar").arg("--version").output() {
+                        Ok(output) if output.status.success() => Some("tar".to_string()),
+                        _ => None,
+                    },
+                }
+            };
+
+            let tar_cmd = match tar_cmd {
+                Some(cmd) => cmd,
+                None => {
+                    let _ = tx.send(ProgressMessage::Error(extract_dir_owned, "tar command not found".to_string()));
+                    let _ = tx.send(ProgressMessage::Completed(0, 1));
+                    return;
+                }
+            };
+
+            // Check if stdbuf is available (in background)
+            let has_stdbuf = Command::new("stdbuf").arg("--version").output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+
+            // Check for cancellation
+            if cancel_flag.load(Ordering::Relaxed) {
+                let _ = tx.send(ProgressMessage::Error(extract_dir_owned, "Cancelled".to_string()));
+                let _ = tx.send(ProgressMessage::Completed(0, 1));
+                return;
+            }
+
+            // List archive contents
+            let _ = tx.send(ProgressMessage::Preparing("Reading archive contents...".to_string()));
+            let (total_file_count, total_bytes, size_map) =
+                Self::list_archive_contents(&tar_cmd, &archive_path_owned, &archive_name_owned);
+
+            // Check for cancellation after listing
+            if cancel_flag.load(Ordering::Relaxed) {
+                let _ = tx.send(ProgressMessage::Error(extract_dir_owned, "Cancelled".to_string()));
+                let _ = tx.send(ProgressMessage::Completed(0, 1));
+                return;
+            }
+
+            if total_file_count == 0 {
+                let _ = tx.send(ProgressMessage::Error(
+                    extract_dir_owned,
+                    "Archive appears to be empty or corrupted".to_string(),
+                ));
+                let _ = tx.send(ProgressMessage::Completed(0, 1));
+                return;
+            }
+
+            // Create extraction directory
+            if let Err(e) = std::fs::create_dir(&extract_path_clone) {
+                let _ = tx.send(ProgressMessage::Error(
+                    extract_dir_owned,
+                    format!("Failed to create directory: {}", e),
+                ));
+                let _ = tx.send(ProgressMessage::Completed(0, 1));
+                return;
+            }
+
+            // Preparation complete, send initial totals
+            let _ = tx.send(ProgressMessage::PrepareComplete);
+            let _ = tx.send(ProgressMessage::TotalProgress(0, total_file_count, 0, total_bytes));
+
+            // Build command arguments
+            let archive_path_str = archive_path_owned.to_string_lossy().to_string();
+            let tar_args = vec![tar_options.to_string(), archive_path_str];
+
+            // Execute tar extraction
+            let child = if has_stdbuf {
+                let mut args = vec!["-oL".to_string(), "-eL".to_string(), tar_cmd.clone()];
+                args.extend(tar_args);
+                Command::new("stdbuf")
+                    .current_dir(&extract_path_clone)
+                    .args(&args)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+            } else {
+                Command::new(&tar_cmd)
+                    .current_dir(&extract_path_clone)
+                    .args(&tar_args)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+            };
+
+            // Cleanup helper for failed extraction
+            let cleanup_extract_dir = |path: &std::path::PathBuf| {
+                let _ = std::fs::remove_dir_all(path);
+            };
+
+            match child {
+                Ok(mut child) => {
+                    let stdout = child.stdout.take();
+                    let stderr = child.stderr.take();
+                    let mut completed_files = 0usize;
+                    let mut completed_bytes = 0u64;
+                    let mut last_error_line: Option<String> = None;
+
+                    // Collect stderr in background for error messages
+                    let stderr_handle = stderr.map(|stderr| {
+                        thread::spawn(move || {
+                            use std::io::Read;
+                            let mut err_str = String::new();
+                            let mut stderr = stderr;
+                            let _ = stderr.read_to_string(&mut err_str);
+                            err_str
+                        })
+                    });
+
+                    // Read stdout line by line for progress updates
+                    if let Some(stdout) = stdout {
+                        use std::io::BufRead;
+                        let mut reader = BufReader::with_capacity(256, stdout);
+                        let mut line = String::new();
+
+                        loop {
+                            // Check for cancellation
+                            if cancel_flag.load(Ordering::Relaxed) {
+                                let _ = child.kill();
+                                cleanup_extract_dir(&extract_path_clone);
+                                let _ = tx.send(ProgressMessage::Error(
+                                    extract_dir_owned.clone(),
+                                    "Cancelled".to_string(),
+                                ));
+                                let _ = tx.send(ProgressMessage::Completed(completed_files, 1));
+                                return;
+                            }
+
+                            line.clear();
+                            match reader.read_line(&mut line) {
+                                Ok(0) => break, // EOF
+                                Ok(_) => {
+                                    let filename = line.trim_end();
+                                    if filename.starts_with("tar:") || filename.starts_with("gtar:") {
+                                        last_error_line = Some(filename.to_string());
+                                    } else if !filename.is_empty() {
+                                        completed_files += 1;
+                                        // Look up file size from the map
+                                        if let Some(&file_size) = size_map.get(filename) {
+                                            completed_bytes += file_size;
+                                        }
+                                        let _ = tx.send(ProgressMessage::FileStarted(filename.to_string()));
+                                        let _ = tx.send(ProgressMessage::FileCompleted(filename.to_string()));
+                                        let _ = tx.send(ProgressMessage::TotalProgress(
+                                            completed_files,
+                                            total_file_count,
+                                            completed_bytes,
+                                            total_bytes,
+                                        ));
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+
+                    // Wait for completion
+                    match child.wait() {
+                        Ok(status) => {
+                            if status.success() {
+                                let _ = tx.send(ProgressMessage::Completed(completed_files, 0));
+                            } else {
+                                cleanup_extract_dir(&extract_path_clone);
+                                let error_msg = last_error_line
+                                    .or_else(|| {
+                                        stderr_handle
+                                            .and_then(|h| h.join().ok())
+                                            .filter(|s| !s.trim().is_empty())
+                                            .map(|s| s.lines().next().unwrap_or("tar extraction failed").to_string())
+                                    })
+                                    .unwrap_or_else(|| "tar extraction failed".to_string());
+                                let _ = tx.send(ProgressMessage::Error(
+                                    extract_dir_owned,
+                                    error_msg,
+                                ));
+                                let _ = tx.send(ProgressMessage::Completed(0, 1));
+                            }
+                        }
+                        Err(e) => {
+                            cleanup_extract_dir(&extract_path_clone);
+                            let _ = tx.send(ProgressMessage::Error(
+                                extract_dir_owned,
+                                e.to_string(),
+                            ));
+                            let _ = tx.send(ProgressMessage::Completed(0, 1));
+                        }
+                    }
+                }
+                Err(e) => {
+                    cleanup_extract_dir(&extract_path_clone);
+                    let _ = tx.send(ProgressMessage::Error(
+                        extract_dir_owned,
+                        format!("Failed to run tar: {}", e),
+                    ));
+                    let _ = tx.send(ProgressMessage::Completed(0, 1));
+                }
+            }
+        });
+    }
+
     pub fn execute_search(&mut self, term: &str) {
         if term.trim().is_empty() {
             self.show_message("Please enter a search term");
@@ -1757,7 +3215,10 @@ impl App {
         let fallback = self.active_panel().path.clone();
         let valid_path = get_valid_path(&path, &fallback);
 
-        if valid_path != fallback {
+        if valid_path == path && valid_path == fallback {
+            // 이미 해당 경로에 있음
+            self.show_message(&format!("Already at: {}", valid_path.display()));
+        } else if valid_path != fallback {
             let panel = self.active_panel_mut();
             panel.path = valid_path.clone();
             panel.selected_index = 0;

@@ -1,6 +1,6 @@
 use ratatui::{
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
@@ -50,19 +50,43 @@ pub fn draw(frame: &mut Frame, panel: &mut PanelState, area: Rect, is_active: bo
 
     // Column widths - adapt to available space
     let min_columns: u16 = 10 + 12 + 4; // size + date + padding
-    let (name_col, size_col, date_col) = if inner.width > min_columns {
-        let name_width = (inner.width - min_columns) as usize;
-        (name_width, 10_usize, 12_usize)
+    let type_col_total: usize = 10; // 2 + 6 + 2 (padding + type + padding)
+
+    // Calculate max file name width (including marker and icon = 2 chars)
+    let max_name_display_width = panel.files.iter()
+        .map(|f| f.name.width() + 2) // +2 for marker and icon
+        .max()
+        .unwrap_or(0);
+
+    let (name_col, type_col, size_col, date_col) = if inner.width > min_columns {
+        let available_for_name = (inner.width - min_columns) as usize;
+
+        // Check if we can show Type column:
+        // All file names must fit without truncation AND
+        // there must be at least type_col_total (10) extra chars of space
+        let show_type = available_for_name >= max_name_display_width + type_col_total;
+
+        if show_type {
+            let name_width = available_for_name - type_col_total;
+            (name_width, 6_usize, 10_usize, 12_usize)
+        } else {
+            (available_for_name, 0_usize, 10_usize, 12_usize)
+        }
     } else {
-        // Very narrow: use all available width for name only, hide size/date
+        // Very narrow: use all available width for name only, hide size/date/type
         let name_width = inner.width.saturating_sub(2) as usize;
-        (name_width, 0_usize, 0_usize)
+        (name_width, 0_usize, 0_usize, 0_usize)
     };
 
     // Header row
-    let header = create_header_line(panel, name_col, size_col, date_col, theme);
+    let header = create_header_line(panel, name_col, type_col, size_col, date_col, is_active, theme);
+    let header_bg = if is_active {
+        theme.bg_header_active
+    } else {
+        theme.bg_header
+    };
     frame.render_widget(
-        Paragraph::new(header),
+        Paragraph::new(header).style(Style::default().bg(header_bg)),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
 
@@ -110,6 +134,7 @@ pub fn draw(frame: &mut Frame, panel: &mut PanelState, area: Rect, is_active: bo
             show_cursor,
             is_marked,
             name_col,
+            type_col,
             size_col,
             date_col,
             theme,
@@ -147,34 +172,75 @@ pub fn draw(frame: &mut Frame, panel: &mut PanelState, area: Rect, is_active: bo
         frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
     }
 
-    // Footer (폴더 수, 파일 수, 전체 용량)
+    // Footer (폴더 정보 + 디스크 용량)
     let dir_count = panel.files.iter().filter(|f| f.name != ".." && f.is_directory).count();
     let file_count = panel.files.iter().filter(|f| !f.is_directory).count();
     let total_size: u64 = panel.files.iter().filter(|f| !f.is_directory).map(|f| f.size).sum();
 
-    let footer_text = format!(
-        "{} folders, {} files, {}",
-        dir_count,
-        file_count,
-        crate::utils::format::format_size(total_size)
-    );
-    let footer = Line::from(Span::styled(footer_text, theme.dim_style()));
+    // 선택된 파일 정보 계산
+    let selected_count = panel.selected_files.len();
+    let selected_size: u64 = panel.files.iter()
+        .filter(|f| panel.selected_files.contains(&f.name))
+        .map(|f| f.size)
+        .sum();
+
+    let number_style = Style::default().fg(theme.panel.directory_text);
+    let label_style = theme.dim_style();
+    let selected_style = Style::default().fg(theme.panel.marked_text);
+
+    let mut spans = vec![
+        Span::styled(format!("{}", dir_count), number_style),
+        Span::styled("d ", label_style),
+        Span::styled(format!("{}", file_count), number_style),
+        Span::styled("f ", label_style),
+        Span::styled(format_size(total_size), number_style),
+    ];
+
+    // 선택된 파일이 있으면 선택 정보 표시
+    if selected_count > 0 {
+        spans.push(Span::styled(" | ", label_style));
+        spans.push(Span::styled(format!("{}", selected_count), selected_style));
+        spans.push(Span::styled("sel ", label_style));
+        spans.push(Span::styled(format_size(selected_size), selected_style));
+    }
+
+    if panel.disk_total > 0 {
+        let disk_free = format_size(panel.disk_available);
+        let disk_total = format_size(panel.disk_total);
+        spans.push(Span::styled(" | ", label_style));
+        spans.push(Span::styled(disk_free, number_style));
+        spans.push(Span::styled("/", label_style));
+        spans.push(Span::styled(disk_total, number_style));
+    }
+
     frame.render_widget(
-        Paragraph::new(footer).alignment(ratatui::layout::Alignment::Center),
+        Paragraph::new(Line::from(spans)).alignment(ratatui::layout::Alignment::Center),
         Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
     );
 }
 
-fn create_header_line(panel: &PanelState, name_width: usize, size_width: usize, date_width: usize, theme: &Theme) -> Line<'static> {
+fn create_header_line(panel: &PanelState, name_width: usize, type_width: usize, size_width: usize, date_width: usize, is_active: bool, theme: &Theme) -> Line<'static> {
+    let header_style = if is_active {
+        Style::default().fg(theme.text_header_active).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.text_header)
+    };
+
     // Handle very narrow width
     if name_width == 0 {
-        return Line::from(Span::styled("", theme.header_style()));
+        return Line::from(Span::styled("", header_style));
     }
 
     let name_indicator = match (panel.sort_by, panel.sort_order) {
         (SortBy::Name, SortOrder::Asc) => "Name\u{25B2}",
         (SortBy::Name, SortOrder::Desc) => "Name\u{25BC}",
         _ => "Name",
+    };
+
+    let type_indicator = match (panel.sort_by, panel.sort_order) {
+        (SortBy::Type, SortOrder::Asc) => "Type\u{25B2}",
+        (SortBy::Type, SortOrder::Desc) => "Type\u{25BC}",
+        _ => "Type",
     };
 
     let size_indicator = match (panel.sort_by, panel.sort_order) {
@@ -191,6 +257,11 @@ fn create_header_line(panel: &PanelState, name_width: usize, size_width: usize, 
 
     // Use saturating_sub to prevent underflow in format width
     let name_col = format!(" {:width$}", name_indicator, width = name_width.saturating_sub(1));
+    let type_col_str = if type_width > 0 {
+        format!("  {:^width$}  ", type_indicator, width = type_width)
+    } else {
+        String::new()
+    };
     let size_col = if size_width > 2 {
         format!("{:>width$}  ", size_indicator, width = size_width.saturating_sub(2))
     } else {
@@ -203,9 +274,10 @@ fn create_header_line(panel: &PanelState, name_width: usize, size_width: usize, 
     };
 
     Line::from(vec![
-        Span::styled(name_col, theme.header_style()),
-        Span::styled(size_col, theme.header_style()),
-        Span::styled(date_col, theme.header_style()),
+        Span::styled(name_col, header_style),
+        Span::styled(type_col_str, header_style),
+        Span::styled(size_col, header_style),
+        Span::styled(date_col, header_style),
     ])
 }
 
@@ -240,11 +312,12 @@ fn create_file_line(
     is_cursor: bool,
     is_marked: bool,
     name_width: usize,
+    type_width: usize,
     size_width: usize,
     date_width: usize,
     theme: &Theme,
 ) -> Line<'static> {
-    let marker = if is_marked { "*" } else { " " };
+    let marker = if is_marked { "✻" } else { " " };
     let icon = if file.is_directory {
         theme.chars.folder.to_string()
     } else {
@@ -273,6 +346,31 @@ fn create_file_line(
     // Pad name column to exact width using unicode-aware padding
     let name_with_prefix = format!("{}{}{}", marker, &icon, display_name);
     let name_col = pad_to_width(&name_with_prefix, name_width);
+
+    // Type column: show file extension (max 6 chars, center aligned)
+    let type_col_str = if type_width > 0 {
+        let type_str = if file.is_directory || file.name == ".." {
+            String::new()
+        } else {
+            std::path::Path::new(&file.name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| {
+                    let lower = e.to_lowercase();
+                    if lower.len() > type_width {
+                        // Truncate with ".." suffix
+                        format!("{}..", &lower[..type_width.saturating_sub(2)])
+                    } else {
+                        lower
+                    }
+                })
+                .unwrap_or_default()
+        };
+        // Center align the type string
+        format!("  {:^width$}  ", type_str, width = type_width)
+    } else {
+        String::new()
+    };
 
     let size_str = if file.is_directory {
         "<DIR>".to_string()
@@ -315,6 +413,7 @@ fn create_file_line(
 
     Line::from(vec![
         Span::styled(name_col, name_style),
+        Span::styled(type_col_str, other_style),
         Span::styled(size_col, other_style),
         Span::styled(date_col, other_style),
     ])

@@ -74,7 +74,7 @@ pub fn get_process_list() -> Vec<ProcessInfo> {
 /// Get list of running processes with error handling
 pub fn get_process_list_result() -> ProcessListResult {
     let output = Command::new("ps")
-        .args(["aux", "--no-headers"])
+        .args(["aux"])
         .output()
         .map_err(|e| format!("Failed to execute ps command: {}", e))?;
 
@@ -86,6 +86,7 @@ pub fn get_process_list_result() -> ProcessListResult {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut processes: Vec<ProcessInfo> = stdout
         .lines()
+        .skip(1) // Skip header line (compatible with both Linux and macOS)
         .filter_map(parse_process_line)
         .collect();
 
@@ -232,8 +233,9 @@ pub fn force_kill_process_with_verification(pid: i32, starttime: Option<u64>) ->
 
 /// Get process command by PID
 fn get_process_command(pid: i32) -> Option<String> {
+    // Use "command=" format to suppress header (POSIX compatible, works on Linux and macOS)
     let output = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command", "--no-headers"])
+        .args(["-p", &pid.to_string(), "-o", "command="])
         .output()
         .ok()?;
 

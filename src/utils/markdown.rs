@@ -665,15 +665,16 @@ impl Default for MarkdownTheme {
 }
 
 impl MarkdownTheme {
+    /// Create MarkdownTheme using only Panel/Viewer/Editor palette colors
     pub fn from_theme(theme: &crate::ui::theme::Theme) -> Self {
         Self {
-            text: theme.text,
-            dim: theme.text_dim,
-            header: theme.info,
-            code: theme.warning,
-            link: theme.info,
-            blockquote: theme.text_header,
-            success: theme.success,
+            text: theme.text,                       // 243: normal text
+            dim: theme.text_dim,                    // 251: dim text
+            header: theme.text_directory,           // 67: directory blue (was info/21)
+            code: theme.editor.footer_key,          // 74: cyan (was warning/198)
+            link: theme.text_directory,             // 67: directory blue (was info/21)
+            blockquote: theme.text_header,          // 249: header text
+            success: theme.editor.footer_key,       // 74: cyan (was success/34)
         }
     }
 }

@@ -11,12 +11,18 @@ use std::sync::Arc;
 pub enum FileOperationType {
     Copy,
     Move,
+    Tar,
+    Untar,
 }
 
 /// Progress message for file operations
 #[derive(Debug, Clone)]
 #[allow(dead_code)]  // Fields are used for debugging/logging, not always read
 pub enum ProgressMessage {
+    /// Preparing operation (message)
+    Preparing(String),
+    /// Preparation complete, starting actual operation
+    PrepareComplete,
     /// File operation started (filename)
     FileStarted(String),
     /// File progress (copied bytes, total bytes)
@@ -150,6 +156,23 @@ where
     let metadata = fs::metadata(src)?;
     let total_size = metadata.len();
 
+    // Check for special files (device files, sockets, etc.) that cannot be copied
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let file_type = metadata.file_type();
+        if file_type.is_block_device()
+            || file_type.is_char_device()
+            || file_type.is_fifo()
+            || file_type.is_socket()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Cannot copy special file (device, socket, or pipe)",
+            ));
+        }
+    }
+
     // Check for cancellation before starting
     if cancel_flag.load(Ordering::Relaxed) {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "Cancelled"));
@@ -230,25 +253,10 @@ pub fn copy_dir_recursive_with_progress(
         let metadata = fs::symlink_metadata(&src_path)?;
 
         if metadata.is_symlink() {
-            // Copy symlink
+            // Copy symlink as-is
             #[cfg(unix)]
             {
                 let link_target = fs::read_link(&src_path)?;
-
-                // Security: Validate symlink target
-                if link_target.is_absolute() {
-                    let target_str = link_target.to_string_lossy();
-                    let sensitive_paths = ["/etc", "/sys", "/proc", "/boot", "/root", "/var/log"];
-                    for sensitive in sensitive_paths {
-                        if target_str.starts_with(sensitive) {
-                            return Err(io::Error::new(
-                                io::ErrorKind::PermissionDenied,
-                                format!("Cannot copy symlink pointing to sensitive path: {}", target_str),
-                            ));
-                        }
-                    }
-                }
-
                 std::os::unix::fs::symlink(&link_target, &dest_path)?;
             }
             #[cfg(not(unix))]
@@ -342,6 +350,9 @@ pub fn copy_files_with_progress(
         .filter(|p| !files_to_skip.contains(p))
         .collect();
 
+    // Send preparing message before calculating sizes
+    let _ = progress_tx.send(ProgressMessage::Preparing("Calculating file sizes...".to_string()));
+
     // Calculate total size
     let (total_bytes, total_files) = match calculate_total_size(&full_paths, &cancel_flag) {
         Ok((size, count)) => (size, count),
@@ -351,6 +362,9 @@ pub fn copy_files_with_progress(
             return;
         }
     };
+
+    // Send prepare complete
+    let _ = progress_tx.send(ProgressMessage::PrepareComplete);
 
     let mut completed_bytes: u64 = 0;
     let mut completed_files: usize = 0;
@@ -486,6 +500,9 @@ pub fn move_files_with_progress(
         .filter(|p| !files_to_skip.contains(p))
         .collect();
 
+    // Send preparing message before calculating sizes
+    let _ = progress_tx.send(ProgressMessage::Preparing("Calculating file sizes...".to_string()));
+
     // Calculate total size upfront for accurate progress
     let (total_bytes, total_files) = match calculate_total_size(&full_paths, &cancel_flag) {
         Ok((size, count)) => (size, count),
@@ -495,6 +512,9 @@ pub fn move_files_with_progress(
             return;
         }
     };
+
+    // Send prepare complete
+    let _ = progress_tx.send(ProgressMessage::PrepareComplete);
 
     let mut completed_bytes: u64 = 0;
     let mut completed_files: usize = 0;
@@ -633,14 +653,16 @@ pub fn move_files_with_progress(
                 Ok(_) => {
                     // Delete source after successful copy
                     if let Err(e) = delete_file(&src) {
-                        // Copy succeeded but delete failed - report but count as success
+                        // Copy succeeded but delete failed - this is a move failure
+                        failure_count += 1;
                         let _ = progress_tx.send(ProgressMessage::Error(
-                            filename.clone(),
-                            format!("Copied but failed to delete source: {}", e),
+                            filename,
+                            format!("Move failed: copied but could not delete source: {}", e),
                         ));
+                    } else {
+                        success_count += 1;
+                        let _ = progress_tx.send(ProgressMessage::FileCompleted(filename));
                     }
-                    success_count += 1;
-                    let _ = progress_tx.send(ProgressMessage::FileCompleted(filename));
                 }
                 Err(e) => {
                     if e.kind() == io::ErrorKind::Interrupted {
@@ -682,6 +704,24 @@ pub fn copy_file(src: &Path, dest: &Path) -> io::Result<()> {
             io::ErrorKind::AlreadyExists,
             "Target already exists. Delete it first or choose a different name.",
         ));
+    }
+
+    // Check for special files (device files, sockets, etc.) that cannot be copied
+    #[cfg(unix)]
+    {
+        let metadata = fs::metadata(src)?;
+        use std::os::unix::fs::FileTypeExt;
+        let file_type = metadata.file_type();
+        if file_type.is_block_device()
+            || file_type.is_char_device()
+            || file_type.is_fifo()
+            || file_type.is_socket()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Cannot copy special file (device, socket, or pipe)",
+            ));
+        }
     }
 
     if src.is_dir() {
@@ -737,26 +777,10 @@ fn copy_dir_recursive_inner(
         let metadata = fs::symlink_metadata(&src_path)?;
 
         if metadata.is_symlink() {
-            // Copy symlink as symlink (don't follow it)
+            // Copy symlink as-is (don't follow it)
             #[cfg(unix)]
             {
                 let link_target = fs::read_link(&src_path)?;
-
-                // Security: Validate symlink target
-                // Reject absolute symlinks pointing to sensitive system paths
-                if link_target.is_absolute() {
-                    let target_str = link_target.to_string_lossy();
-                    let sensitive_paths = ["/etc", "/sys", "/proc", "/boot", "/root", "/var/log"];
-                    for sensitive in sensitive_paths {
-                        if target_str.starts_with(sensitive) {
-                            return Err(io::Error::new(
-                                io::ErrorKind::PermissionDenied,
-                                format!("Cannot copy symlink pointing to sensitive path: {}", target_str),
-                            ));
-                        }
-                    }
-                }
-
                 std::os::unix::fs::symlink(&link_target, &dest_path)?;
             }
             #[cfg(not(unix))]
@@ -814,27 +838,9 @@ pub fn move_file(src: &Path, dest: &Path) -> io::Result<()> {
     }
 }
 
-/// Protected system paths that should never be deleted
-const PROTECTED_PATHS: &[&str] = &[
-    "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64",
-    "/opt", "/proc", "/root", "/sbin", "/sys", "/tmp", "/usr", "/var",
-];
-
 /// Delete a file or directory
 pub fn delete_file(path: &Path) -> io::Result<()> {
-    // Security: Prevent deletion of protected system paths
-    if let Ok(canonical) = path.canonicalize() {
-        let path_str = canonical.to_string_lossy();
-        for protected in PROTECTED_PATHS {
-            if path_str == *protected {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("Cannot delete protected system path: {}", protected),
-                ));
-            }
-        }
-    }
-
+    // Use symlink_metadata to check if it's a symlink
     let metadata = fs::symlink_metadata(path)?;
 
     if metadata.is_symlink() {
@@ -916,6 +922,295 @@ pub fn is_valid_filename(name: &str) -> Result<(), &'static str> {
     }
 
     Ok(())
+}
+
+/// Sensitive paths that symlinks should not point to
+const SENSITIVE_PATHS: &[&str] = &[
+    "/etc", "/sys", "/proc", "/boot", "/root", "/var/log",
+    "/home", "/dev", "/tmp", "/run", "/var/run",
+];
+
+/// Check symlinks in files to be archived for security
+/// Returns an error if any symlink points outside base_dir or to sensitive system paths
+pub fn check_symlinks_for_tar(base_dir: &Path, files: &[String]) -> io::Result<()> {
+    use std::collections::HashSet;
+    let mut visited = HashSet::new();
+    for file in files {
+        let file_path = base_dir.join(file);
+        check_symlink_recursive(&file_path, base_dir, &mut visited)?;
+    }
+    Ok(())
+}
+
+/// Recursively check symlinks in a file or directory
+fn check_symlink_recursive(
+    path: &Path,
+    base_dir: &Path,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+) -> io::Result<()> {
+    // Detect symlink loops using visited set
+    if let Ok(canonical_path) = path.canonicalize() {
+        if !visited.insert(canonical_path.clone()) {
+            // Already visited - symlink loop detected, skip to avoid infinite recursion
+            return Ok(());
+        }
+    }
+
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) => {
+            // File doesn't exist - this is a dangling symlink if parent exists
+            if path.parent().map(|p| p.exists()).unwrap_or(false) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Dangling symlink or inaccessible file: {}", path.display()),
+                ));
+            }
+            return Err(e);
+        }
+    };
+
+    if metadata.is_symlink() {
+        let link_target = fs::read_link(path)?;
+
+        // Absolute symlinks pointing outside base_dir are always rejected
+        if link_target.is_absolute() {
+            // Check if it points inside base_dir
+            if let Ok(base_canonical) = base_dir.canonicalize() {
+                if let Ok(target_canonical) = link_target.canonicalize() {
+                    if !target_canonical.starts_with(&base_canonical) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!(
+                                "Symlink '{}' points outside archive directory: {}",
+                                path.display(),
+                                link_target.display()
+                            ),
+                        ));
+                    }
+                } else {
+                    // Can't resolve target - reject absolute symlinks to non-existent paths
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "Symlink '{}' points to unresolvable absolute path: {}",
+                            path.display(),
+                            link_target.display()
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // Resolve the symlink target to check where it actually points
+        let resolved_target = if link_target.is_absolute() {
+            link_target.clone()
+        } else {
+            // Relative symlink - resolve from the symlink's parent directory
+            let parent = path.parent().unwrap_or(base_dir);
+            parent.join(&link_target)
+        };
+
+        // Get canonical path to resolve all symlinks and ".." components
+        match resolved_target.canonicalize() {
+            Ok(canonical) => {
+                let target_str = canonical.to_string_lossy();
+
+                // Check if symlink points outside base_dir
+                if let Ok(base_canonical) = base_dir.canonicalize() {
+                    if !canonical.starts_with(&base_canonical) {
+                        // Check against sensitive paths for better error message
+                        for sensitive in SENSITIVE_PATHS {
+                            if target_str.starts_with(sensitive) {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    format!(
+                                        "Symlink '{}' points to sensitive system path: {}",
+                                        path.display(),
+                                        target_str
+                                    ),
+                                ));
+                            }
+                        }
+                        // Even if not a sensitive path, reject any symlink pointing outside base_dir
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!(
+                                "Symlink '{}' points outside archive directory: {}",
+                                path.display(),
+                                target_str
+                            ),
+                        ));
+                    }
+                }
+            }
+            Err(_) => {
+                // Cannot resolve the target - this could be a dangling symlink
+                // or circular reference. Reject for safety.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Symlink '{}' has unresolvable target: {}",
+                        path.display(),
+                        link_target.display()
+                    ),
+                ));
+            }
+        }
+    } else if metadata.is_dir() {
+        // Recursively check directory contents
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                check_symlink_recursive(&entry.path(), base_dir, visited)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Filter out unsafe symlinks from files to be archived
+/// Returns (files, excluded_paths) - original files and paths to exclude via tar --exclude
+pub fn filter_symlinks_for_tar(base_dir: &Path, files: &[String]) -> (Vec<String>, Vec<String>) {
+    use std::collections::HashSet;
+    let mut excluded_paths = Vec::new();
+    let mut visited = HashSet::new();
+
+    for file in files {
+        let file_path = base_dir.join(file);
+        collect_unsafe_symlinks(&file_path, base_dir, file, &mut excluded_paths, &mut visited);
+    }
+
+    (files.to_vec(), excluded_paths)
+}
+
+/// Recursively collect unsafe symlinks paths for exclusion
+fn collect_unsafe_symlinks(
+    path: &Path,
+    base_dir: &Path,
+    relative_path: &str,
+    excluded: &mut Vec<String>,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+) {
+    // Detect symlink loops
+    if let Ok(canonical_path) = path.canonicalize() {
+        if !visited.insert(canonical_path.clone()) {
+            return; // Already visited, skip
+        }
+    }
+
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => {
+            // Can't access - exclude it
+            excluded.push(relative_path.to_string());
+            return;
+        }
+    };
+
+    if metadata.is_symlink() {
+        // Check if symlink is safe
+        let is_unsafe = match fs::read_link(path) {
+            Ok(link_target) => {
+                let resolved_target = if link_target.is_absolute() {
+                    link_target.clone()
+                } else {
+                    let parent = path.parent().unwrap_or(base_dir);
+                    parent.join(&link_target)
+                };
+
+                match resolved_target.canonicalize() {
+                    Ok(canonical) => {
+                        if let Ok(base_canonical) = base_dir.canonicalize() {
+                            !canonical.starts_with(&base_canonical)
+                        } else {
+                            true // Can't resolve base, unsafe
+                        }
+                    }
+                    Err(_) => true, // Can't resolve (dangling symlink)
+                }
+            }
+            Err(_) => true, // Can't read link
+        };
+
+        if is_unsafe {
+            excluded.push(relative_path.to_string());
+        }
+    } else if metadata.is_dir() {
+        // Recursively check directory contents
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let entry_name = entry.file_name().to_string_lossy().to_string();
+                let entry_relative = format!("{}/{}", relative_path, entry_name);
+                collect_unsafe_symlinks(&entry.path(), base_dir, &entry_relative, excluded, visited);
+            }
+        }
+    }
+}
+
+/// Filter out sensitive symlinks from files to be copied
+/// Returns list of relative paths that point to sensitive system paths
+pub fn filter_sensitive_symlinks_for_copy(base_dir: &Path, files: &[String]) -> Vec<String> {
+    use std::collections::HashSet;
+    let mut excluded_paths = Vec::new();
+    let mut visited = HashSet::new();
+
+    for file in files {
+        let file_path = base_dir.join(file);
+        collect_sensitive_symlinks(&file_path, file, &mut excluded_paths, &mut visited);
+    }
+
+    excluded_paths
+}
+
+/// Recursively collect symlinks pointing to sensitive paths
+fn collect_sensitive_symlinks(
+    path: &Path,
+    relative_path: &str,
+    excluded: &mut Vec<String>,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+) {
+    // Detect symlink loops
+    if let Ok(canonical_path) = path.canonicalize() {
+        if !visited.insert(canonical_path.clone()) {
+            return; // Already visited, skip
+        }
+    }
+
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => return, // Can't access, skip
+    };
+
+    if metadata.is_symlink() {
+        // Check if symlink points to sensitive path
+        if let Ok(link_target) = fs::read_link(path) {
+            let resolved_target = if link_target.is_absolute() {
+                link_target.clone()
+            } else {
+                path.parent().unwrap_or(Path::new("/")).join(&link_target)
+            };
+
+            if let Ok(canonical) = resolved_target.canonicalize() {
+                let target_str = canonical.to_string_lossy();
+                for sensitive in SENSITIVE_PATHS {
+                    if target_str.starts_with(sensitive) {
+                        excluded.push(relative_path.to_string());
+                        return;
+                    }
+                }
+            }
+        }
+    } else if metadata.is_dir() {
+        // Recursively check directory contents
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let entry_name = entry.file_name().to_string_lossy().to_string();
+                let entry_relative = format!("{}/{}", relative_path, entry_name);
+                collect_sensitive_symlinks(&entry.path(), &entry_relative, excluded, visited);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1187,16 +1482,6 @@ mod tests {
         cleanup_temp_dir(&temp_dir);
     }
 
-    #[test]
-    fn test_delete_protected_path_rejected() {
-        // Test that protected paths cannot be deleted
-        for protected in PROTECTED_PATHS {
-            let result = delete_file(Path::new(protected));
-            // Either permission denied or the path protection kicks in
-            assert!(result.is_err());
-        }
-    }
-
     #[cfg(unix)]
     #[test]
     fn test_delete_symlink() {
@@ -1286,6 +1571,162 @@ mod tests {
         let result = rename_file(&old_path, &new_path);
         assert!(result.is_err());
         assert!(result.unwrap_err().kind() == std::io::ErrorKind::AlreadyExists);
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    // ========== check_symlinks_for_tar tests ==========
+
+    #[test]
+    fn test_check_symlinks_for_tar_regular_files() {
+        let temp_dir = create_temp_dir();
+
+        File::create(temp_dir.join("file1.txt")).unwrap();
+        File::create(temp_dir.join("file2.txt")).unwrap();
+
+        let files = vec!["file1.txt".to_string(), "file2.txt".to_string()];
+        let result = check_symlinks_for_tar(&temp_dir, &files);
+        assert!(result.is_ok());
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_symlinks_for_tar_safe_symlink() {
+        let temp_dir = create_temp_dir();
+
+        // Create a file and a symlink pointing to it (safe - within the directory)
+        let target = temp_dir.join("target.txt");
+        File::create(&target).unwrap();
+        std::os::unix::fs::symlink("target.txt", temp_dir.join("link")).unwrap();
+
+        let files = vec!["link".to_string()];
+        let result = check_symlinks_for_tar(&temp_dir, &files);
+        assert!(result.is_ok());
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_symlinks_for_tar_sensitive_symlink_rejected() {
+        let temp_dir = create_temp_dir();
+
+        // Create a symlink pointing to /etc (sensitive path)
+        std::os::unix::fs::symlink("/etc/passwd", temp_dir.join("sensitive_link")).unwrap();
+
+        let files = vec!["sensitive_link".to_string()];
+        let result = check_symlinks_for_tar(&temp_dir, &files);
+        assert!(result.is_err());
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_symlinks_for_tar_nested_symlink() {
+        let temp_dir = create_temp_dir();
+
+        // Create a subdirectory with a file and a safe symlink
+        fs::create_dir_all(temp_dir.join("subdir")).unwrap();
+        File::create(temp_dir.join("subdir/file.txt")).unwrap();
+        std::os::unix::fs::symlink("file.txt", temp_dir.join("subdir/link")).unwrap();
+
+        let files = vec!["subdir".to_string()];
+        let result = check_symlinks_for_tar(&temp_dir, &files);
+        assert!(result.is_ok());
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_symlinks_for_tar_nested_sensitive_rejected() {
+        let temp_dir = create_temp_dir();
+
+        // Create a subdirectory with a sensitive symlink inside
+        fs::create_dir_all(temp_dir.join("subdir")).unwrap();
+        std::os::unix::fs::symlink("/etc", temp_dir.join("subdir/etc_link")).unwrap();
+
+        let files = vec!["subdir".to_string()];
+        let result = check_symlinks_for_tar(&temp_dir, &files);
+        assert!(result.is_err());
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_symlinks_for_tar_dangling_symlink_rejected() {
+        let temp_dir = create_temp_dir();
+
+        // Create a symlink pointing to non-existent path
+        std::os::unix::fs::symlink("/nonexistent/path/file", temp_dir.join("dangling")).unwrap();
+
+        let files = vec!["dangling".to_string()];
+        let result = check_symlinks_for_tar(&temp_dir, &files);
+        assert!(result.is_err());
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_symlinks_for_tar_outside_basedir_rejected() {
+        let temp_dir = create_temp_dir();
+
+        // Create a symlink pointing outside base_dir (to /usr which is not sensitive but outside)
+        std::os::unix::fs::symlink("/usr", temp_dir.join("usr_link")).unwrap();
+
+        let files = vec!["usr_link".to_string()];
+        let result = check_symlinks_for_tar(&temp_dir, &files);
+        assert!(result.is_err());
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_symlinks_for_tar_home_symlink_rejected() {
+        let temp_dir = create_temp_dir();
+
+        // Create a symlink pointing to /home (now in SENSITIVE_PATHS)
+        std::os::unix::fs::symlink("/home", temp_dir.join("home_link")).unwrap();
+
+        let files = vec!["home_link".to_string()];
+        let result = check_symlinks_for_tar(&temp_dir, &files);
+        assert!(result.is_err());
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_symlinks_for_tar_dev_symlink_rejected() {
+        let temp_dir = create_temp_dir();
+
+        // Create a symlink pointing to /dev (now in SENSITIVE_PATHS)
+        std::os::unix::fs::symlink("/dev/null", temp_dir.join("dev_link")).unwrap();
+
+        let files = vec!["dev_link".to_string()];
+        let result = check_symlinks_for_tar(&temp_dir, &files);
+        assert!(result.is_err());
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_symlinks_for_tar_relative_escape_rejected() {
+        let temp_dir = create_temp_dir();
+
+        // Create a symlink using relative path to escape base_dir
+        std::os::unix::fs::symlink("../../etc/passwd", temp_dir.join("relative_escape")).unwrap();
+
+        let files = vec!["relative_escape".to_string()];
+        let result = check_symlinks_for_tar(&temp_dir, &files);
+        assert!(result.is_err());
 
         cleanup_temp_dir(&temp_dir);
     }

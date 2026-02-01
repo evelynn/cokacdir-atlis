@@ -7,6 +7,9 @@ use ratatui::{
     Frame,
 };
 use rand::Rng;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
@@ -89,13 +92,13 @@ fn normalize_empty_lines(text: &str) -> String {
     result_lines.join("\n")
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryItem {
     pub item_type: HistoryType,
     pub content: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HistoryType {
     User,
     Assistant,
@@ -141,6 +144,20 @@ pub struct AIScreenState {
 /// Maximum number of history items to retain
 const MAX_HISTORY_ITEMS: usize = 500;
 
+/// Session data structure for file persistence
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionData {
+    session_id: String,
+    history: Vec<HistoryItem>,
+    current_path: String,
+    created_at: String,
+}
+
+/// Get the AI sessions directory path (~/.cokacdir/ai_sessions)
+fn ai_sessions_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".cokacdir").join("ai_sessions"))
+}
+
 impl AIScreenState {
     /// Add item to history with size limit to prevent memory exhaustion
     /// Also normalizes consecutive empty lines in content
@@ -155,6 +172,162 @@ impl AIScreenState {
             content: normalize_empty_lines(&item.content),
         };
         self.history.push(normalized_item);
+    }
+
+    /// Validate session ID to prevent path injection attacks
+    fn is_valid_session_id(session_id: &str) -> bool {
+        // Prevent path traversal
+        if session_id.contains('/') || session_id.contains('\\') || session_id.contains("..") {
+            return false;
+        }
+
+        // Must not be empty and have reasonable length
+        if session_id.is_empty() || session_id.len() > 64 {
+            return false;
+        }
+
+        // Reject control characters
+        if session_id.chars().any(|c| c.is_control()) {
+            return false;
+        }
+
+        // Only allow alphanumeric, dash, underscore
+        session_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    }
+
+    /// Save current session to file (~/.cokacdir/ai_sessions/[session_id].json)
+    pub fn save_session_to_file(&self) {
+        // Only save if we have a session_id and some history
+        let Some(ref session_id) = self.session_id else {
+            return;
+        };
+
+        // Security: Validate session ID before using as filename
+        if !Self::is_valid_session_id(session_id) {
+            return;
+        }
+
+        // Filter out system messages (warnings) - only save user conversations
+        let saveable_history: Vec<HistoryItem> = self.history.iter()
+            .filter(|item| item.item_type != HistoryType::System)
+            .cloned()
+            .collect();
+
+        if saveable_history.is_empty() {
+            return;
+        }
+
+        let Some(sessions_dir) = ai_sessions_dir() else {
+            return;
+        };
+
+        // Create sessions directory if it doesn't exist
+        if let Err(_) = fs::create_dir_all(&sessions_dir) {
+            return;
+        }
+
+        let session_data = SessionData {
+            session_id: session_id.clone(),
+            history: saveable_history,
+            current_path: self.current_path.clone(),
+            created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        };
+
+        let file_path = sessions_dir.join(format!("{}.json", session_id));
+
+        // Security: Verify the path is within sessions directory
+        if let Some(parent) = file_path.parent() {
+            if parent != sessions_dir {
+                return;
+            }
+        }
+
+        if let Ok(json) = serde_json::to_string_pretty(&session_data) {
+            let _ = fs::write(file_path, json);
+        }
+    }
+
+    /// Load the most recent session for the given path
+    /// Returns None if no matching session exists for current_path
+    pub fn load_latest_session(current_path: String) -> Option<Self> {
+        let sessions_dir = ai_sessions_dir()?;
+
+        if !sessions_dir.exists() {
+            return None;
+        }
+
+        // Find the most recently modified session file that matches current_path
+        let mut matching_session: Option<(SessionData, std::time::SystemTime)> = None;
+
+        if let Ok(entries) = fs::read_dir(&sessions_dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if path.extension().map(|e| e == "json").unwrap_or(false) {
+                    // Read and parse each session file
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        if let Ok(session_data) = serde_json::from_str::<SessionData>(&content) {
+                            // Only consider sessions with matching path
+                            if session_data.current_path == current_path {
+                                if let Ok(metadata) = path.metadata() {
+                                    if let Ok(modified) = metadata.modified() {
+                                        match &matching_session {
+                                            None => matching_session = Some((session_data, modified)),
+                                            Some((_, latest_time)) if modified > *latest_time => {
+                                                matching_session = Some((session_data, modified));
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let (session_data, _) = matching_session?;
+
+        // Create state with loaded session
+        let claude_available = claude::is_claude_available();
+        let placeholder_index = rand::thread_rng().gen_range(0..PLACEHOLDER_MESSAGES.len());
+
+        let mut state = Self {
+            history: Vec::new(),
+            input_lines: vec![String::new()],
+            cursor_line: 0,
+            cursor_col: 0,
+            session_id: Some(session_data.session_id),
+            is_processing: false,
+            scroll_offset: usize::MAX,  // Sentinel: scroll to bottom on first draw
+            auto_scroll: true,
+            claude_available,
+            current_path,  // Use current path, not session's stored path
+            placeholder_index,
+            response_receiver: None,
+            last_max_scroll: 0,
+            last_total_lines: 0,
+            last_visible_height: 0,
+            last_visible_width: 0,
+            last_raw_lines: 0,
+        };
+
+        // Add warning message first
+        state.history.push(HistoryItem {
+            item_type: HistoryType::System,
+            content: "⚠ Warning: AI commands may execute real operations on your system. Please use with caution.".to_string(),
+        });
+
+        // Add restored session indicator
+        state.history.push(HistoryItem {
+            item_type: HistoryType::System,
+            content: "📂 Session restored from previous conversation".to_string(),
+        });
+
+        // Append loaded history
+        state.history.extend(session_data.history);
+
+        Some(state)
     }
 
     pub fn new(current_path: String) -> Self {
@@ -199,35 +372,6 @@ impl AIScreenState {
         }
 
         state
-    }
-
-    /// Create state with existing history and session (for session persistence)
-    pub fn with_session(
-        current_path: String,
-        history: Vec<HistoryItem>,
-        session_id: Option<String>,
-    ) -> Self {
-        let claude_available = claude::is_claude_available();
-        let placeholder_index = rand::thread_rng().gen_range(0..PLACEHOLDER_MESSAGES.len());
-        Self {
-            history,
-            input_lines: vec![String::new()],
-            cursor_line: 0,
-            cursor_col: 0,
-            session_id,
-            is_processing: false,
-            scroll_offset: usize::MAX,  // 센티널: 첫 draw에서 맨 아래로
-            auto_scroll: true,
-            claude_available,
-            current_path,
-            placeholder_index,
-            response_receiver: None,
-            last_max_scroll: 0,
-            last_total_lines: 0,
-            last_visible_height: 0,
-            last_visible_width: 0,
-            last_raw_lines: 0,
-        }
     }
 
     /// Get current input text from lines
@@ -532,11 +676,17 @@ Keep responses concise and terminal-friendly.",
 }
 
 pub fn draw(frame: &mut Frame, state: &mut AIScreenState, area: Rect, theme: &Theme) {
+    // Fill background first
+    let background = Block::default()
+        .style(Style::default().bg(theme.ai_screen.bg));
+    frame.render_widget(background, area);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(5),    // History area
-            Constraint::Length(3), // Input area
+            Constraint::Min(5),    // History area (no bottom border)
+            Constraint::Length(1), // Separator line (├───┤)
+            Constraint::Length(2), // Input area (no top border, reduced height)
             Constraint::Length(1), // Help
         ])
         .split(area);
@@ -544,36 +694,42 @@ pub fn draw(frame: &mut Frame, state: &mut AIScreenState, area: Rect, theme: &Th
     // History area (with path and session in title)
     draw_history(frame, state, chunks[0], theme);
 
-    // Input area
-    draw_input(frame, state, chunks[1], theme);
+    // Draw separator line between history and input (├───┤)
+    draw_separator(frame, chunks[1], theme);
 
-    // Help (same style as main screen function bar)
+    // Input area
+    draw_input(frame, state, chunks[2], theme);
+
+    // Help (footer area)
+    let key_style = Style::default().fg(theme.ai_screen.footer_key).add_modifier(Modifier::BOLD);
+    let text_style = Style::default().fg(theme.ai_screen.footer_text);
+
     let help_spans = if state.is_processing {
         vec![
-            Span::styled("Esc", theme.header_style()),
-            Span::styled(" Cancel ", theme.dim_style()),
-            Span::styled("PgUp", theme.header_style()),
-            Span::styled("/", theme.dim_style()),
-            Span::styled("PgDn", theme.header_style()),
-            Span::styled(" Scroll", theme.dim_style()),
+            Span::styled("Esc", key_style),
+            Span::styled(" Cancel ", text_style),
+            Span::styled("PgUp", key_style),
+            Span::styled("/", text_style),
+            Span::styled("PgDn", key_style),
+            Span::styled(" Scroll", text_style),
         ]
     } else {
         vec![
-            Span::styled("Enter", theme.header_style()),
-            Span::styled(" Send ", theme.dim_style()),
-            Span::styled("↑↓", theme.header_style()),
-            Span::styled("/", theme.dim_style()),
-            Span::styled("PgUp", theme.header_style()),
-            Span::styled("/", theme.dim_style()),
-            Span::styled("PgDn", theme.header_style()),
-            Span::styled(" Scroll ", theme.dim_style()),
-            Span::styled("Esc", theme.header_style()),
-            Span::styled(" Close", theme.dim_style()),
+            Span::styled("Enter", key_style),
+            Span::styled(" Send ", text_style),
+            Span::styled("Up/Dn", key_style),
+            Span::styled("/", text_style),
+            Span::styled("PgUp", key_style),
+            Span::styled("/", text_style),
+            Span::styled("PgDn", key_style),
+            Span::styled(" Scroll ", text_style),
+            Span::styled("Esc", key_style),
+            Span::styled(" Close", text_style),
         ]
     };
     frame.render_widget(
         Paragraph::new(Line::from(help_spans)),
-        chunks[2],
+        chunks[3],
     );
 }
 
@@ -588,11 +744,12 @@ fn draw_history(frame: &mut Frame, state: &mut AIScreenState, area: Rect, theme:
     let title = format!(" {} | {} ", state.current_path, session_info);
 
     let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme.border_style(true))
+        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+        .border_style(Style::default().fg(theme.ai_screen.history_border))
+        .style(Style::default().bg(theme.ai_screen.bg))
         .title(Span::styled(
             title,
-            Style::default().fg(theme.border_active).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.ai_screen.history_title).add_modifier(Modifier::BOLD),
         ));
 
     let inner = block.inner(area);
@@ -601,7 +758,7 @@ fn draw_history(frame: &mut Frame, state: &mut AIScreenState, area: Rect, theme:
     if state.history.is_empty() {
         let placeholder = Paragraph::new(Span::styled(
             state.get_placeholder(),
-            theme.dim_style(),
+            Style::default().fg(theme.ai_screen.history_placeholder),
         ));
         frame.render_widget(placeholder, inner);
         return;
@@ -616,13 +773,14 @@ fn draw_history(frame: &mut Frame, state: &mut AIScreenState, area: Rect, theme:
 
     for item in &state.history {
         let (icon, color) = match item.item_type {
-            HistoryType::User => ("> ", theme.info),
-            HistoryType::Assistant => ("< ", theme.success),
-            HistoryType::Error => ("! ", theme.error),
-            HistoryType::System => ("* ", theme.text_dim),
+            HistoryType::User => ("> ", theme.ai_screen.user_prefix),
+            HistoryType::Assistant => ("< ", theme.ai_screen.assistant_prefix),
+            HistoryType::Error => ("! ", theme.ai_screen.error_prefix),
+            HistoryType::System => ("* ", theme.ai_screen.system_prefix),
         };
 
         let prefix_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+        let message_style = Style::default().fg(theme.ai_screen.message_text);
 
         // For assistant messages, render Markdown
         if item.item_type == HistoryType::Assistant {
@@ -640,7 +798,7 @@ fn draw_history(frame: &mut Frame, state: &mut AIScreenState, area: Rect, theme:
                 let prefix = if i == 0 { icon } else { "  " };
                 lines.push(Line::from(vec![
                     Span::styled(prefix, prefix_style),
-                    Span::styled(line_text.to_string(), theme.normal_style()),
+                    Span::styled(line_text.to_string(), message_style),
                 ]));
             }
         }
@@ -730,19 +888,39 @@ fn draw_history(frame: &mut Frame, state: &mut AIScreenState, area: Rect, theme:
         let info_len = scroll_info.len() as u16;
         let indicator_x = inner.x + inner.width.saturating_sub(info_len + 1);
         frame.render_widget(
-            Paragraph::new(Span::styled(scroll_info, theme.dim_style())),
+            Paragraph::new(Span::styled(
+                scroll_info,
+                Style::default().fg(theme.ai_screen.history_scroll_info),
+            )),
             Rect::new(indicator_x, inner.y, info_len, 1),
         );
     }
 }
 
-fn draw_input(frame: &mut Frame, state: &AIScreenState, area: Rect, theme: &Theme) {
-    let input_color = theme.success;
+/// Draw separator line between history and input boxes (├───┤)
+fn draw_separator(frame: &mut Frame, area: Rect, theme: &Theme) {
+    if area.width < 2 {
+        return;
+    }
 
+    let border_style = Style::default().fg(theme.ai_screen.history_border);
+
+    // Build separator line: ├ + ─── + ┤
+    let line = Line::from(vec![
+        Span::styled("├", border_style),
+        Span::styled("─".repeat((area.width - 2) as usize), border_style),
+        Span::styled("┤", border_style),
+    ]);
+
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn draw_input(frame: &mut Frame, state: &AIScreenState, area: Rect, theme: &Theme) {
+    // Use only LEFT, RIGHT, BOTTOM borders (top is shared separator line)
     let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(input_color))
-        .border_type(ratatui::widgets::BorderType::Rounded);
+        .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+        .border_style(Style::default().fg(theme.ai_screen.input_border))
+        .style(Style::default().bg(theme.ai_screen.bg));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -757,16 +935,19 @@ fn draw_input(frame: &mut Frame, state: &AIScreenState, area: Rect, theme: &Them
         let processing_line = Line::from(vec![
             Span::styled(
                 format!("{} ", spinner_frames[frame_idx]),
-                Style::default().fg(theme.info),
+                Style::default().fg(theme.ai_screen.processing_spinner),
             ),
-            Span::styled("Processing... (Esc to cancel)", theme.dim_style()),
+            Span::styled(
+                "Processing... (Esc to cancel)",
+                Style::default().fg(theme.ai_screen.processing_text),
+            ),
         ]);
         frame.render_widget(Paragraph::new(processing_line), inner);
     } else if !state.claude_available {
         frame.render_widget(
             Paragraph::new(Span::styled(
                 "Claude CLI not available",
-                theme.error_style(),
+                Style::default().fg(theme.ai_screen.error_text),
             )),
             inner,
         );
@@ -776,9 +957,9 @@ fn draw_input(frame: &mut Frame, state: &AIScreenState, area: Rect, theme: &Them
         if input_text.is_empty() {
             // Show placeholder with cursor
             let placeholder_line = Line::from(vec![
-                Span::styled("> ", Style::default().fg(input_color)),
-                Span::styled("_", Style::default().fg(theme.border_active).add_modifier(Modifier::SLOW_BLINK)),
-                Span::styled(state.get_placeholder(), theme.dim_style()),
+                Span::styled("> ", Style::default().fg(theme.ai_screen.input_prompt)),
+                Span::styled("_", Style::default().fg(theme.ai_screen.input_cursor).add_modifier(Modifier::SLOW_BLINK)),
+                Span::styled(state.get_placeholder(), Style::default().fg(theme.ai_screen.input_placeholder)),
             ]);
             frame.render_widget(Paragraph::new(placeholder_line), inner);
         } else {
@@ -794,15 +975,15 @@ fn draw_input(frame: &mut Frame, state: &AIScreenState, area: Rect, theme: &Them
                     let after: String = chars.iter().skip(state.cursor_col).collect();
 
                     lines.push(Line::from(vec![
-                        Span::styled(prefix, Style::default().fg(input_color)),
-                        Span::styled(before, theme.normal_style()),
-                        Span::styled("_", Style::default().fg(theme.border_active).add_modifier(Modifier::SLOW_BLINK)),
-                        Span::styled(after, theme.normal_style()),
+                        Span::styled(prefix, Style::default().fg(theme.ai_screen.input_prompt)),
+                        Span::styled(before, Style::default().fg(theme.ai_screen.input_text)),
+                        Span::styled("_", Style::default().fg(theme.ai_screen.input_cursor).add_modifier(Modifier::SLOW_BLINK)),
+                        Span::styled(after, Style::default().fg(theme.ai_screen.input_text)),
                     ]));
                 } else {
                     lines.push(Line::from(vec![
-                        Span::styled(prefix, Style::default().fg(input_color)),
-                        Span::styled(line_text.clone(), theme.normal_style()),
+                        Span::styled(prefix, Style::default().fg(theme.ai_screen.input_prompt)),
+                        Span::styled(line_text.clone(), Style::default().fg(theme.ai_screen.input_text)),
                     ]));
                 }
             }
@@ -1074,7 +1255,13 @@ pub fn handle_input(state: &mut AIScreenState, code: KeyCode, modifiers: KeyModi
         }
         KeyCode::Char(c) => {
             if !ctrl {
-                state.insert_char(c);
+                // 방어적 처리: 일부 터미널에서 Shift+문자가 소문자로 올 수 있음
+                let ch = if shift && c.is_ascii_lowercase() {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                };
+                state.insert_char(ch);
             }
         }
         _ => {}

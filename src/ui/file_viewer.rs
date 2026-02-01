@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::{
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
@@ -45,11 +45,17 @@ pub struct ViewerState {
     // 검색
     pub search_mode: bool,
     pub search_input: String,
+    pub search_cursor_pos: usize,
     pub search_term: String,
     pub search_options: SearchOptions,
     pub match_lines: Vec<usize>,
     pub match_positions: Vec<(usize, usize, usize)>, // (line, start, end)
     pub current_match: usize,
+
+    // 검색 Regex 캐싱 (성능 최적화)
+    cached_regex: Option<Regex>,
+    cached_pattern: String,
+    cached_case_sensitive: bool,
 
     // 북마크
     pub bookmarks: HashSet<usize>,
@@ -69,6 +75,9 @@ pub struct ViewerState {
     // 파일 정보
     pub file_size: u64,
     pub total_lines: usize,
+
+    // 화면 크기 (렌더링 시 업데이트)
+    pub visible_height: usize,
 }
 
 impl ViewerState {
@@ -83,11 +92,15 @@ impl ViewerState {
             word_wrap: false,
             search_mode: false,
             search_input: String::new(),
+            search_cursor_pos: 0,
             search_term: String::new(),
             search_options: SearchOptions::default(),
             match_lines: Vec::new(),
             match_positions: Vec::new(),
             current_match: 0,
+            cached_regex: None,
+            cached_pattern: String::new(),
+            cached_case_sensitive: false,
             bookmarks: HashSet::new(),
             goto_mode: false,
             goto_input: String::new(),
@@ -97,6 +110,7 @@ impl ViewerState {
             is_binary: false,
             file_size: 0,
             total_lines: 0,
+            visible_height: 20, // 기본값, 렌더링 시 업데이트됨
         }
     }
 
@@ -220,38 +234,67 @@ impl ViewerState {
         lines
     }
 
-    /// 검색 수행
+    /// 검색 수행 (with regex caching for performance)
     pub fn perform_search(&mut self) {
         self.match_lines.clear();
         self.match_positions.clear();
 
         if self.search_term.is_empty() {
+            self.cached_regex = None;
+            self.cached_pattern.clear();
             return;
         }
 
-        let pattern = if self.search_options.use_regex {
+        // Build the full pattern with options
+        let base_pattern = if self.search_options.use_regex {
             self.search_term.clone()
         } else {
             regex::escape(&self.search_term)
         };
 
-        let pattern = if self.search_options.whole_word {
-            format!(r"\b{}\b", pattern)
+        let full_pattern = if self.search_options.whole_word {
+            format!(r"\b{}\b", base_pattern)
         } else {
-            pattern
+            base_pattern
         };
 
-        let regex = if self.search_options.case_sensitive {
-            Regex::new(&pattern)
-        } else {
-            Regex::new(&format!("(?i){}", pattern))
-        };
+        // Check if we need to recompile the regex (caching optimization)
+        let needs_recompile = self.cached_regex.is_none()
+            || self.cached_pattern != full_pattern
+            || self.cached_case_sensitive != self.search_options.case_sensitive;
 
-        if let Ok(re) = regex {
+        if needs_recompile {
+            let regex_pattern = if self.search_options.case_sensitive {
+                full_pattern.clone()
+            } else {
+                format!("(?i){}", full_pattern)
+            };
+
+            match Regex::new(&regex_pattern) {
+                Ok(re) => {
+                    self.cached_regex = Some(re);
+                    self.cached_pattern = full_pattern;
+                    self.cached_case_sensitive = self.search_options.case_sensitive;
+                }
+                Err(_) => {
+                    self.cached_regex = None;
+                    self.cached_pattern.clear();
+                    return;
+                }
+            }
+        }
+
+        // Use cached regex for search
+        if let Some(ref re) = self.cached_regex {
             for (line_idx, line) in self.lines.iter().enumerate() {
                 let mut has_match = false;
                 for mat in re.find_iter(line) {
-                    self.match_positions.push((line_idx, mat.start(), mat.end()));
+                    // 바이트 인덱스를 문자 인덱스로 변환
+                    let byte_start = mat.start();
+                    let byte_end = mat.end();
+                    let char_start = line[..byte_start].chars().count();
+                    let char_end = char_start + line[byte_start..byte_end].chars().count();
+                    self.match_positions.push((line_idx, char_start, char_end));
                     has_match = true;
                 }
                 if has_match {
@@ -264,27 +307,27 @@ impl ViewerState {
         self.scroll_to_current_match();
     }
 
-    /// 현재 매치로 스크롤
+    /// 현재 매치로 스크롤 (match_positions 기준)
     pub fn scroll_to_current_match(&mut self) {
-        if !self.match_lines.is_empty() && self.current_match < self.match_lines.len() {
-            let line = self.match_lines[self.current_match];
+        if !self.match_positions.is_empty() && self.current_match < self.match_positions.len() {
+            let (line, _, _) = self.match_positions[self.current_match];
             self.scroll = line.saturating_sub(5);
         }
     }
 
     /// 다음 매치
     pub fn next_match(&mut self) {
-        if !self.match_lines.is_empty() {
-            self.current_match = (self.current_match + 1) % self.match_lines.len();
+        if !self.match_positions.is_empty() {
+            self.current_match = (self.current_match + 1) % self.match_positions.len();
             self.scroll_to_current_match();
         }
     }
 
     /// 이전 매치
     pub fn prev_match(&mut self) {
-        if !self.match_lines.is_empty() {
+        if !self.match_positions.is_empty() {
             self.current_match = if self.current_match == 0 {
-                self.match_lines.len() - 1
+                self.match_positions.len() - 1
             } else {
                 self.current_match - 1
             };
@@ -375,12 +418,7 @@ impl ViewerState {
     }
 }
 
-pub fn draw(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
-    let state = match &app.viewer_state {
-        Some(s) => s,
-        None => return,
-    };
-
+pub fn draw(frame: &mut Frame, state: &mut ViewerState, area: Rect, theme: &Theme) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme.border_style(true));
@@ -392,9 +430,12 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         return;
     }
 
+    // 화면 크기 업데이트 (스크롤 계산에 사용)
+    let visible_lines = (inner.height - 2) as usize;
+    state.visible_height = visible_lines;
+
     // Header
     let total_lines = state.lines.len();
-    let visible_lines = (inner.height - 2) as usize;
     let end_line = (state.scroll + visible_lines).min(total_lines);
     let percentage = if total_lines > 0 {
         ((end_line as f32 / total_lines as f32) * 100.0) as u32
@@ -483,8 +524,6 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
             .take(content_height)
             .enumerate()
         {
-            let is_match = state.match_lines.contains(orig_line_num);
-            let is_current_match = state.match_lines.get(state.current_match) == Some(orig_line_num);
             let is_bookmarked = state.bookmarks.contains(orig_line_num);
 
             // 줄 번호 (첫 줄만 표시)
@@ -503,21 +542,12 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
                 Span::styled("     ", theme.dim_style()) // 연속 줄은 빈 줄번호
             };
 
-            // 라인 배경 스타일
-            let line_bg_style = if is_current_match {
-                theme.selected_style()
-            } else if is_match {
-                theme.warning_style()
-            } else {
-                theme.normal_style()
-            };
+            // 라인 배경 스타일 (에디터와 동일하게 매치된 텍스트만 하이라이트)
+            let line_bg_style = theme.normal_style();
 
             // 콘텐츠 렌더링 (검색 하이라이트 또는 문법 강조)
             let content_spans = if state.mode == ViewerMode::Hex {
-                vec![Span::styled(display_text.clone(), line_bg_style)]
-            } else if !state.search_term.is_empty() {
-                // 검색어 하이라이트 (wrapped 텍스트에 대해)
-                highlight_search_in_wrapped_line(display_text, &state.search_term, line_bg_style, theme)
+                render_hex_line(display_text, theme)
             } else if let Some(ref mut hl) = hl_for_wrap {
                 // 새로운 원본 줄이면 하이라이터 상태 업데이트
                 if last_orig_line != Some(*orig_line_num) {
@@ -539,23 +569,17 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
                     last_orig_line = Some(*orig_line_num);
                 }
 
-                // wrapped 텍스트에 대해 토큰화
-                let tokens = hl.tokenize_line(display_text);
-                if tokens.is_empty() {
-                    vec![Span::styled(display_text.clone(), line_bg_style)]
-                } else {
-                    tokens
-                        .into_iter()
-                        .map(|token| {
-                            let style = hl.style_for(token.token_type);
-                            let final_style = match line_bg_style.bg {
-                                Some(bg) => style.bg(bg),
-                                None => style,
-                            };
-                            Span::styled(token.text, final_style)
-                        })
-                        .collect()
-                }
+                // 문법 강조와 검색 하이라이트를 함께 처리 (wrapped 모드)
+                render_wrapped_line_with_syntax_and_search(
+                    display_text,
+                    hl,
+                    &state.search_term,
+                    line_bg_style,
+                    theme,
+                )
+            } else if !state.match_positions.is_empty() {
+                // 검색어 하이라이트 (wrapped 텍스트에 대해)
+                highlight_search_in_wrapped_line(display_text, &state.search_term, line_bg_style, theme)
             } else {
                 vec![Span::styled(display_text.clone(), line_bg_style)]
             };
@@ -572,8 +596,6 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         // 일반 모드 (word wrap 없음)
         for (i, line) in state.lines.iter().skip(state.scroll).take(content_height).enumerate() {
             let line_num = state.scroll + i;
-            let is_match = state.match_lines.contains(&line_num);
-            let is_current_match = state.match_lines.get(state.current_match) == Some(&line_num);
             let is_bookmarked = state.bookmarks.contains(&line_num);
 
             // 줄 번호
@@ -588,22 +610,25 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
                 line_num_style,
             );
 
-            // 라인 배경 스타일
-            let line_bg_style = if is_current_match {
-                theme.selected_style()
-            } else if is_match {
-                theme.warning_style()
-            } else {
-                theme.normal_style()
-            };
+            // 라인 배경 스타일 (에디터와 동일하게 매치된 텍스트만 하이라이트)
+            let line_bg_style = theme.normal_style();
 
             // 콘텐츠 렌더링
             let content_spans = if state.mode == ViewerMode::Hex {
                 render_hex_line(line, theme)
-            } else if !state.search_term.is_empty() {
-                highlight_search_in_line(line, &state.match_positions, line_num, line_bg_style, theme)
             } else if let Some(ref mut hl) = highlighter {
-                render_syntax_highlighted_line(line, hl, line_bg_style)
+                // 문법 강조와 검색 하이라이트를 함께 처리
+                render_line_with_syntax_and_search(
+                    line,
+                    hl,
+                    &state.match_positions,
+                    line_num,
+                    state.current_match,
+                    line_bg_style,
+                    theme,
+                )
+            } else if !state.match_positions.is_empty() {
+                highlight_search_in_line(line, &state.match_positions, line_num, state.current_match, line_bg_style, theme)
             } else {
                 vec![Span::styled(line.clone(), line_bg_style)]
             };
@@ -672,71 +697,93 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
             if state.search_options.use_regex { " Re" } else { "" },
             if state.search_options.whole_word { " W" } else { "" }
         );
-        let search_line = Line::from(vec![
-            Span::styled("Search: ", theme.header_style()),
-            Span::styled(&state.search_input, theme.normal_style()),
-            Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
-            Span::styled(format!(" {}", search_opts), theme.dim_style()),
-        ]);
-        frame.render_widget(
-            Paragraph::new(search_line).style(theme.status_bar_style()),
-            Rect::new(inner.x, footer_y, inner.width, 1),
-        );
-    } else {
-        let search_info = if !state.search_term.is_empty() {
-            format!(
-                "\"{}\" {} matches ({}/{}) ",
-                if state.search_term.chars().count() > 20 {
-                    let truncated: String = state.search_term.chars().take(17).collect();
-                    format!("{}...", truncated)
-                } else {
-                    state.search_term.clone()
-                },
-                state.match_lines.len(),
-                if state.match_lines.is_empty() {
-                    0
-                } else {
-                    state.current_match + 1
-                },
-                state.match_lines.len()
-            )
+
+        let cursor_style = Style::default()
+            .fg(theme.viewer.search_cursor_fg)
+            .bg(theme.viewer.search_cursor_bg)
+            .add_modifier(Modifier::SLOW_BLINK);
+        let input_style = Style::default().fg(theme.viewer.search_input_text);
+
+        // 커서 위치 기반 텍스트 분리
+        let search_chars: Vec<char> = state.search_input.chars().collect();
+        let cursor_pos = state.search_cursor_pos.min(search_chars.len());
+        let before: String = search_chars[..cursor_pos].iter().collect();
+        let cursor_char = if cursor_pos < search_chars.len() {
+            search_chars[cursor_pos].to_string()
+        } else {
+            " ".to_string()
+        };
+        let after: String = if cursor_pos < search_chars.len() {
+            search_chars[cursor_pos + 1..].iter().collect()
         } else {
             String::new()
         };
 
+        // 매치 정보
+        let (match_info, match_info_style) = if !state.match_positions.is_empty() {
+            let count = state.match_positions.len();
+            (format!(
+                " {}/{} ({} matches) ",
+                state.current_match + 1,
+                count,
+                count
+            ), theme.dim_style())
+        } else if !state.search_term.is_empty() {
+            (" No matches ".to_string(), theme.dim_style())
+        } else {
+            (String::new(), theme.dim_style())
+        };
+
+        let mut spans = vec![
+            Span::styled("Find: ", theme.header_style()),
+            Span::styled(before, input_style),
+            Span::styled(cursor_char, cursor_style),
+            Span::styled(after, input_style),
+            Span::styled(match_info, match_info_style),
+            Span::styled(format!("{} ", search_opts), theme.dim_style()),
+        ];
+
+        // 단축키 안내 (에디터와 동일)
+        spans.push(Span::styled("^N", theme.header_style()));
+        spans.push(Span::styled("ext ", theme.dim_style()));
+        spans.push(Span::styled("^P", theme.header_style()));
+        spans.push(Span::styled("rev ", theme.dim_style()));
+        spans.push(Span::styled("^C", theme.header_style()));
+        spans.push(Span::styled("ase ", theme.dim_style()));
+        spans.push(Span::styled("^R", theme.header_style()));
+        spans.push(Span::styled("egex ", theme.dim_style()));
+        spans.push(Span::styled("^W", theme.header_style()));
+        spans.push(Span::styled("ord ", theme.dim_style()));
+        spans.push(Span::styled("Esc", theme.header_style()));
+
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).style(theme.status_bar_style()),
+            Rect::new(inner.x, footer_y, inner.width, 1),
+        );
+    } else {
         let wrap_indicator = if state.word_wrap { "Wrap " } else { "" };
 
         // 단축키 spans 생성
-        let mut footer_spans = vec![
-            Span::styled(search_info, theme.header_style()),
-        ];
+        let mut footer_spans = vec![];
 
         if !wrap_indicator.is_empty() {
-            footer_spans.push(Span::styled(wrap_indicator, theme.info_style()));
+            footer_spans.push(Span::styled(wrap_indicator, Style::default().fg(theme.viewer.wrap_indicator)));
         }
 
-        // 단축키 표시: 첫 글자 강조
+        // 단축키 표시: Ctrl 조합 형식 (에디터와 통일)
         let shortcuts = [
-            ("q", "uit "),
+            ("^Q", "uit "),
+            ("^F", "ind "),
+            ("^G", "oto "),
             ("e", "dit "),
-            ("/", "search "),
-            ("g", "oto "),
-            ("b", "mark "),
             ("w", "rap "),
-            ("H", "ex"),
+            ("H", "ex "),
+            ("b", "mark"),
         ];
 
         for (key, rest) in shortcuts {
             footer_spans.push(Span::styled(key, theme.header_style()));
             footer_spans.push(Span::styled(rest, theme.dim_style()));
-        }
-
-        // 검색 중일 때만 n/N 표시
-        if !state.search_term.is_empty() {
-            footer_spans.push(Span::styled(" n", theme.header_style()));
-            footer_spans.push(Span::styled("ext ", theme.dim_style()));
-            footer_spans.push(Span::styled("N", theme.header_style()));
-            footer_spans.push(Span::styled("prev", theme.dim_style()));
         }
 
         let footer = Line::from(footer_spans);
@@ -757,7 +804,7 @@ fn render_hex_line(line: &str, theme: &Theme) -> Vec<Span<'static>> {
         // 오프셋
         spans.push(Span::styled(
             line[..offset_end].to_string(),
-            Style::default().fg(theme.text_dim),
+            Style::default().fg(theme.viewer.hex_offset),
         ));
         spans.push(Span::styled("  ".to_string(), theme.normal_style()));
 
@@ -766,12 +813,12 @@ fn render_hex_line(line: &str, theme: &Theme) -> Vec<Span<'static>> {
             // 헥스 바이트
             spans.push(Span::styled(
                 rest[..ascii_start].to_string(),
-                Style::default().fg(theme.info),
+                Style::default().fg(theme.viewer.hex_bytes),
             ));
             // ASCII
             spans.push(Span::styled(
                 rest[ascii_start..].to_string(),
-                Style::default().fg(theme.text_directory),
+                Style::default().fg(theme.viewer.hex_ascii),
             ));
         } else {
             spans.push(Span::styled(rest.to_string(), theme.normal_style()));
@@ -788,13 +835,16 @@ fn highlight_search_in_line(
     line: &str,
     match_positions: &[(usize, usize, usize)],
     line_num: usize,
+    current_match: usize,
     base_style: Style,
     theme: &Theme,
 ) -> Vec<Span<'static>> {
+    // 매치 인덱스와 함께 수집
     let matches: Vec<_> = match_positions
         .iter()
-        .filter(|(ln, _, _)| *ln == line_num)
-        .map(|(_, s, e)| (*s, *e))
+        .enumerate()
+        .filter(|(_, (ln, _, _))| *ln == line_num)
+        .map(|(idx, (_, s, e))| (idx, *s, *e))
         .collect();
 
     if matches.is_empty() {
@@ -805,7 +855,7 @@ fn highlight_search_in_line(
     let chars: Vec<char> = line.chars().collect();
     let mut last_end = 0;
 
-    for (start, end) in matches {
+    for (match_idx, start, end) in matches {
         let start = start.min(chars.len());
         let end = end.min(chars.len());
 
@@ -815,11 +865,21 @@ fn highlight_search_in_line(
                 base_style,
             ));
         }
+
+        // 현재 매치와 다른 매치 구분 (에디터와 동일한 색상)
+        let match_style = if match_idx == current_match {
+            Style::default()
+                .bg(theme.bg_selected)
+                .fg(theme.bg)
+        } else {
+            Style::default()
+                .bg(theme.shortcut_key)
+                .fg(theme.bg)
+        };
+
         spans.push(Span::styled(
             chars[start..end].iter().collect::<String>(),
-            Style::default()
-                .fg(ratatui::style::Color::Black)
-                .bg(theme.warning),
+            match_style,
         ));
         last_end = end;
     }
@@ -855,22 +915,25 @@ fn highlight_search_in_wrapped_line(
     let mut spans = Vec::new();
     let mut last_end = 0;
 
-    for (start, _) in lower_line.match_indices(&lower_term) {
-        let end = start + search_term.len();
+    // Wrapped 모드에서는 현재 매치 구분이 어려우므로 동일한 스타일 사용 (에디터와 동일한 색상)
+    let match_style = Style::default()
+        .bg(theme.shortcut_key)
+        .fg(theme.bg);
 
-        if start > last_end {
+    for (byte_start, matched) in lower_line.match_indices(&lower_term) {
+        let byte_end = byte_start + matched.len();
+
+        if byte_start > last_end {
             spans.push(Span::styled(
-                line[last_end..start].to_string(),
+                line[last_end..byte_start].to_string(),
                 base_style,
             ));
         }
         spans.push(Span::styled(
-            line[start..end].to_string(),
-            Style::default()
-                .fg(ratatui::style::Color::Black)
-                .bg(theme.warning),
+            line[byte_start..byte_end].to_string(),
+            match_style,
         ));
-        last_end = end;
+        last_end = byte_end;
     }
 
     if last_end < line.len() {
@@ -878,6 +941,207 @@ fn highlight_search_in_wrapped_line(
             line[last_end..].to_string(),
             base_style,
         ));
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::styled(line.to_string(), base_style));
+    }
+
+    spans
+}
+
+/// 문법 강조와 검색 하이라이트를 함께 처리하는 라인 렌더링
+fn render_line_with_syntax_and_search(
+    line: &str,
+    highlighter: &mut SyntaxHighlighter,
+    match_positions: &[(usize, usize, usize)],
+    line_num: usize,
+    current_match: usize,
+    base_style: Style,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let tokens = highlighter.tokenize_line(line);
+    let chars: Vec<char> = line.chars().collect();
+
+    // 이 라인의 매치 정보 수집
+    let line_matches: Vec<_> = match_positions
+        .iter()
+        .enumerate()
+        .filter(|(_, (ln, _, _))| *ln == line_num)
+        .map(|(idx, (_, s, e))| (idx, *s, *e))
+        .collect();
+
+    // 매치가 없으면 일반 문법 강조만 적용
+    if line_matches.is_empty() {
+        if tokens.is_empty() {
+            return vec![Span::styled(line.to_string(), base_style)];
+        }
+        return tokens
+            .into_iter()
+            .map(|token| {
+                let style = highlighter.style_for(token.token_type);
+                let final_style = match base_style.bg {
+                    Some(bg) => style.bg(bg),
+                    None => style,
+                };
+                Span::styled(token.text, final_style)
+            })
+            .collect();
+    }
+
+    // 문자 단위로 처리하여 문법 강조 + 검색 하이라이트 적용
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut char_idx = 0;
+
+    for token in &tokens {
+        let token_chars: Vec<char> = token.text.chars().collect();
+        let token_style = highlighter.style_for(token.token_type);
+
+        for c in &token_chars {
+            let mut style = token_style;
+
+            // 검색 매치 확인
+            for &(match_idx, start, end) in &line_matches {
+                if char_idx >= start && char_idx < end {
+                    // 매치된 부분: 배경색 적용, 문법 강조의 modifier(이탤릭 등) 유지
+                    if match_idx == current_match {
+                        style = style.bg(theme.bg_selected).fg(theme.bg);
+                    } else {
+                        style = style.bg(theme.shortcut_key).fg(theme.bg);
+                    }
+                    break;
+                }
+            }
+
+            spans.push(Span::styled(c.to_string(), style));
+            char_idx += 1;
+        }
+    }
+
+    // 토큰이 없는 경우 (빈 줄 등)
+    if spans.is_empty() && !chars.is_empty() {
+        for (i, c) in chars.iter().enumerate() {
+            let mut style = base_style;
+
+            for &(match_idx, start, end) in &line_matches {
+                if i >= start && i < end {
+                    if match_idx == current_match {
+                        style = style.bg(theme.bg_selected).fg(theme.bg);
+                    } else {
+                        style = style.bg(theme.shortcut_key).fg(theme.bg);
+                    }
+                    break;
+                }
+            }
+
+            spans.push(Span::styled(c.to_string(), style));
+        }
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::styled(line.to_string(), base_style));
+    }
+
+    spans
+}
+
+/// Wrapped 모드에서 문법 강조와 검색 하이라이트를 함께 처리
+fn render_wrapped_line_with_syntax_and_search(
+    line: &str,
+    highlighter: &mut SyntaxHighlighter,
+    search_term: &str,
+    base_style: Style,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let tokens = highlighter.tokenize_line(line);
+    let chars: Vec<char> = line.chars().collect();
+
+    // 검색어가 없으면 일반 문법 강조만 적용
+    if search_term.is_empty() {
+        if tokens.is_empty() {
+            return vec![Span::styled(line.to_string(), base_style)];
+        }
+        return tokens
+            .into_iter()
+            .map(|token| {
+                let style = highlighter.style_for(token.token_type);
+                let final_style = match base_style.bg {
+                    Some(bg) => style.bg(bg),
+                    None => style,
+                };
+                Span::styled(token.text, final_style)
+            })
+            .collect();
+    }
+
+    // 검색 매치 위치 찾기 (대소문자 무시, 바이트 인덱스를 문자 인덱스로 변환)
+    let lower_line = line.to_lowercase();
+    let lower_term = search_term.to_lowercase();
+    let match_ranges: Vec<(usize, usize)> = lower_line
+        .match_indices(&lower_term)
+        .map(|(byte_start, matched)| {
+            let char_start = lower_line[..byte_start].chars().count();
+            let char_end = char_start + matched.chars().count();
+            (char_start, char_end)
+        })
+        .collect();
+
+    if match_ranges.is_empty() {
+        if tokens.is_empty() {
+            return vec![Span::styled(line.to_string(), base_style)];
+        }
+        return tokens
+            .into_iter()
+            .map(|token| {
+                let style = highlighter.style_for(token.token_type);
+                let final_style = match base_style.bg {
+                    Some(bg) => style.bg(bg),
+                    None => style,
+                };
+                Span::styled(token.text, final_style)
+            })
+            .collect();
+    }
+
+    // 문자 단위로 처리하여 문법 강조 + 검색 하이라이트 적용
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut char_idx = 0;
+
+    for token in &tokens {
+        let token_chars: Vec<char> = token.text.chars().collect();
+        let token_style = highlighter.style_for(token.token_type);
+
+        for c in &token_chars {
+            let mut style = token_style;
+
+            // 검색 매치 확인
+            for &(start, end) in &match_ranges {
+                if char_idx >= start && char_idx < end {
+                    // 매치된 부분: 배경색 적용, 문법 강조의 modifier(이탤릭 등) 유지
+                    style = style.bg(theme.shortcut_key).fg(theme.bg);
+                    break;
+                }
+            }
+
+            spans.push(Span::styled(c.to_string(), style));
+            char_idx += 1;
+        }
+    }
+
+    // 토큰이 없는 경우
+    if spans.is_empty() && !chars.is_empty() {
+        for (i, c) in chars.iter().enumerate() {
+            let mut style = base_style;
+
+            for &(start, end) in &match_ranges {
+                if i >= start && i < end {
+                    style = style.bg(theme.shortcut_key).fg(theme.bg);
+                    break;
+                }
+            }
+
+            spans.push(Span::styled(c.to_string(), style));
+        }
     }
 
     if spans.is_empty() {
@@ -947,40 +1211,94 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         match code {
             KeyCode::Esc => {
                 state.search_mode = false;
-                state.search_input.clear();
+                // 에디터와 동일하게 검색 결과 초기화 (검색어는 유지)
+                state.match_positions.clear();
+                state.match_lines.clear();
             }
             KeyCode::Enter => {
+                // 항상 새로 검색
                 state.search_term = state.search_input.clone();
-                state.search_mode = false;
                 state.perform_search();
+                // 검색 모드 유지 (에디터와 동일)
             }
             KeyCode::Backspace => {
-                state.search_input.pop();
+                if state.search_cursor_pos > 0 {
+                    let mut chars: Vec<char> = state.search_input.chars().collect();
+                    chars.remove(state.search_cursor_pos - 1);
+                    state.search_input = chars.into_iter().collect();
+                    state.search_cursor_pos -= 1;
+                }
             }
-            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                // Ctrl+C: 대소문자 구분 토글
+            KeyCode::Delete => {
+                let char_count = state.search_input.chars().count();
+                if state.search_cursor_pos < char_count {
+                    let mut chars: Vec<char> = state.search_input.chars().collect();
+                    chars.remove(state.search_cursor_pos);
+                    state.search_input = chars.into_iter().collect();
+                }
+            }
+            KeyCode::Left => {
+                if state.search_cursor_pos > 0 {
+                    state.search_cursor_pos -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if state.search_cursor_pos < state.search_input.chars().count() {
+                    state.search_cursor_pos += 1;
+                }
+            }
+            KeyCode::Home => {
+                state.search_cursor_pos = 0;
+            }
+            KeyCode::End => {
+                state.search_cursor_pos = state.search_input.chars().count();
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') if modifiers.contains(KeyModifiers::CONTROL) => {
                 state.search_options.case_sensitive = !state.search_options.case_sensitive;
             }
-            KeyCode::Char('r') if modifiers.contains(KeyModifiers::CONTROL) => {
-                // Ctrl+R: 정규식 토글
+            KeyCode::Char('r') | KeyCode::Char('R') if modifiers.contains(KeyModifiers::CONTROL) => {
                 state.search_options.use_regex = !state.search_options.use_regex;
             }
-            KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
-                // Ctrl+W: 단어 단위 검색 토글
+            KeyCode::Char('w') | KeyCode::Char('W') if modifiers.contains(KeyModifiers::CONTROL) => {
                 state.search_options.whole_word = !state.search_options.whole_word;
             }
-            KeyCode::Char(c) => {
-                state.search_input.push(c);
+            KeyCode::Char('n') | KeyCode::Char('N') if modifiers.contains(KeyModifiers::CONTROL) => {
+                state.next_match();
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') if modifiers.contains(KeyModifiers::CONTROL) => {
+                state.prev_match();
+            }
+            KeyCode::Down => {
+                state.next_match();
+            }
+            KeyCode::Up => {
+                state.prev_match();
+            }
+            KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                // Shift 처리: 일부 터미널에서 Shift+문자가 소문자로 올 수 있음
+                let ch = if modifiers.contains(KeyModifiers::SHIFT) && c.is_ascii_lowercase() {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                };
+                let mut chars: Vec<char> = state.search_input.chars().collect();
+                chars.insert(state.search_cursor_pos, ch);
+                state.search_input = chars.into_iter().collect();
+                state.search_cursor_pos += 1;
             }
             _ => {}
         }
         return;
     }
 
-    let visible_lines = 20;
+    let visible_lines = state.visible_height;
 
     match code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+        // ^Q: quit (Esc도 유지)
+        KeyCode::Esc => {
+            app.current_screen = Screen::DualPanel;
+        }
+        KeyCode::Char('q') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.current_screen = Screen::DualPanel;
         }
         KeyCode::Char('e') | KeyCode::Char('E') => {
@@ -1034,24 +1352,17 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             let max = state.lines.len().saturating_sub(visible_lines);
             state.scroll = (state.scroll + visible_lines).min(max);
         }
-        KeyCode::Home | KeyCode::Char('g') if !modifiers.contains(KeyModifiers::SHIFT) => {
-            // Both Home and 'g' (without modifiers) scroll to top
-            if code == KeyCode::Home || (code == KeyCode::Char('g') && modifiers.is_empty()) {
-                state.scroll = 0;
-            }
+        KeyCode::Home => {
+            state.scroll = 0;
         }
         KeyCode::End | KeyCode::Char('G') => {
             state.scroll = state.lines.len().saturating_sub(visible_lines);
         }
-        KeyCode::Char('/') => {
+        // ^F: find/search
+        KeyCode::Char('f') | KeyCode::Char('F') if modifiers.contains(KeyModifiers::CONTROL) => {
             state.search_mode = true;
             state.search_input.clear();
-        }
-        KeyCode::Char('n') => {
-            state.next_match();
-        }
-        KeyCode::Char('N') => {
-            state.prev_match();
+            state.search_cursor_pos = 0;
         }
         KeyCode::Char('b') => {
             // 현재 줄 북마크 토글

@@ -217,6 +217,10 @@ class ToolInstaller:
         extracted_dir = self.tools_dir / f"zig-{self.config.host_os}-{self.config.host_arch}-{self.config.zig_version}"
         if extracted_dir.exists() and extracted_dir != self.zig_dir:
             if self.zig_dir.exists():
+                # Security: Verify the path is within tools_dir before deletion
+                if not self._is_safe_path_for_deletion(self.zig_dir):
+                    self.logger.error(f"Refusing to delete unsafe path: {self.zig_dir}")
+                    return False
                 shutil.rmtree(self.zig_dir)
             extracted_dir.rename(self.zig_dir)
 
@@ -368,11 +372,71 @@ class ToolInstaller:
                 dest.unlink()
             return False
 
+    def _is_safe_path_for_deletion(self, path: Path) -> bool:
+        """Check if a path is safe to delete (within tools_dir and not a symlink escape)."""
+        try:
+            # Resolve symlinks to get the real path
+            resolved_path = path.resolve()
+            tools_dir_resolved = self.tools_dir.resolve()
+
+            # Ensure the resolved path is within tools_dir
+            if not (str(resolved_path).startswith(str(tools_dir_resolved) + os.sep) or
+                    resolved_path == tools_dir_resolved):
+                return False
+
+            # If the path is a symlink, also check that the target is within tools_dir
+            if path.is_symlink():
+                link_target = path.readlink()
+                if link_target.is_absolute():
+                    target_resolved = link_target.resolve()
+                else:
+                    target_resolved = (path.parent / link_target).resolve()
+
+                if not (str(target_resolved).startswith(str(tools_dir_resolved) + os.sep) or
+                        target_resolved == tools_dir_resolved):
+                    return False
+
+            return True
+        except (ValueError, OSError):
+            return False
+
+    def _is_safe_tar_member(self, member: tarfile.TarInfo, dest_dir: Path) -> bool:
+        """Check if a tar member is safe to extract (no path traversal)."""
+        # Reject absolute paths
+        if member.name.startswith('/'):
+            return False
+
+        # Reject paths with parent directory references
+        if '..' in member.name.split('/'):
+            return False
+
+        # Resolve the final path and ensure it's within dest_dir
+        try:
+            dest_dir_resolved = dest_dir.resolve()
+            member_path = (dest_dir / member.name).resolve()
+            # Check if the resolved path is within the destination directory
+            return str(member_path).startswith(str(dest_dir_resolved) + os.sep) or member_path == dest_dir_resolved
+        except (ValueError, OSError):
+            return False
+
     def extract_tar_xz(self, archive: Path, dest_dir: Path) -> bool:
-        """Extract a .tar.xz archive."""
+        """Extract a .tar.xz archive with path traversal protection."""
         self.logger.info(f"Extracting {archive.name}...")
         try:
             with tarfile.open(archive, "r:xz") as tar:
+                # Validate all members before extraction
+                for member in tar.getmembers():
+                    if not self._is_safe_tar_member(member, dest_dir):
+                        self.logger.error(f"Unsafe path in archive: {member.name}")
+                        return False
+                    # Also reject symbolic links pointing outside
+                    if member.issym() or member.islnk():
+                        link_target = member.linkname
+                        if link_target.startswith('/') or '..' in link_target.split('/'):
+                            self.logger.error(f"Unsafe symlink in archive: {member.name} -> {link_target}")
+                            return False
+
+                # Safe to extract
                 tar.extractall(path=dest_dir)
             self.logger.success("Extraction complete")
             return True

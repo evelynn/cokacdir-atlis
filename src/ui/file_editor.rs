@@ -51,6 +51,10 @@ pub enum EditAction {
         old_content: String,
         new_content: String,
     },
+    SwapLines {
+        line1: usize,
+        line2: usize,
+    },
     Batch {
         actions: Vec<EditAction>,
     },
@@ -107,6 +111,9 @@ pub struct FindReplaceOptions {
     pub whole_word: bool,
 }
 
+/// Default maximum memory for undo/redo stacks (50MB)
+const DEFAULT_MAX_UNDO_MEMORY: usize = 50 * 1024 * 1024;
+
 /// 편집기 상태
 #[derive(Debug)]
 pub struct EditorState {
@@ -117,11 +124,17 @@ pub struct EditorState {
     pub scroll: usize,
     pub horizontal_scroll: usize,
     pub modified: bool,
+    pub original_lines: Vec<String>,
 
     // Undo/Redo
     pub undo_stack: VecDeque<EditAction>,
     pub redo_stack: VecDeque<EditAction>,
     pub max_undo_size: usize,
+
+    // Memory tracking for undo/redo
+    undo_memory_usage: usize,
+    redo_memory_usage: usize,
+    max_undo_memory: usize,
 
     // 선택
     pub selection: Option<Selection>,
@@ -130,12 +143,15 @@ pub struct EditorState {
     // 찾기/바꾸기
     pub find_mode: FindReplaceMode,
     pub find_input: String,
+    pub find_cursor_pos: usize,
     pub replace_input: String,
+    pub replace_cursor_pos: usize,
     pub find_term: String,
     pub find_options: FindReplaceOptions,
     pub match_positions: Vec<(usize, usize, usize)>,
     pub current_match: usize,
     pub input_focus: usize, // 0: find, 1: replace
+    pub find_error: Option<String>, // 정규식 에러 메시지
 
     // Goto
     pub goto_mode: bool,
@@ -154,9 +170,43 @@ pub struct EditorState {
 
     // 괄호 매칭
     pub matching_bracket: Option<(usize, usize)>,
+
+    // 다중 커서 (Ctrl+D)
+    pub cursors: Vec<(usize, usize)>,  // (line, col) 추가 커서들
+    pub last_word_selection: Option<String>,  // 마지막 선택된 단어 (Ctrl+D용)
+
+    // Esc 두 번 누르기 상태
+    pub pending_exit: bool,
+
+    // 화면 크기 (렌더링 시 업데이트)
+    pub visible_height: usize,
+    pub visible_width: usize,
+
+    // 상태 메시지 (일시적으로 표시)
+    pub message: Option<String>,
+    pub message_timer: u8,
 }
 
 impl EditorState {
+    /// Estimate memory size of an EditAction
+    fn estimate_action_size(action: &EditAction) -> usize {
+        match action {
+            EditAction::Insert { text, .. } => text.len() + 32,
+            EditAction::Delete { text, .. } => text.len() + 32,
+            EditAction::InsertLine { content, .. } => content.len() + 24,
+            EditAction::DeleteLine { content, .. } => content.len() + 24,
+            EditAction::MergeLine { .. } => 24,
+            EditAction::SplitLine { .. } => 24,
+            EditAction::Replace { old_content, new_content, .. } => {
+                old_content.len() + new_content.len() + 32
+            }
+            EditAction::SwapLines { .. } => 24,
+            EditAction::Batch { actions } => {
+                actions.iter().map(Self::estimate_action_size).sum::<usize>() + 24
+            }
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             file_path: PathBuf::new(),
@@ -166,19 +216,26 @@ impl EditorState {
             scroll: 0,
             horizontal_scroll: 0,
             modified: false,
+            original_lines: vec![String::new()],
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             max_undo_size: 1000,
+            undo_memory_usage: 0,
+            redo_memory_usage: 0,
+            max_undo_memory: DEFAULT_MAX_UNDO_MEMORY,
             selection: None,
             clipboard: String::new(),
             find_mode: FindReplaceMode::None,
             find_input: String::new(),
+            find_cursor_pos: 0,
             replace_input: String::new(),
+            replace_cursor_pos: 0,
             find_term: String::new(),
             find_options: FindReplaceOptions::default(),
             match_positions: Vec::new(),
             current_match: 0,
             input_focus: 0,
+            find_error: None,
             goto_mode: false,
             goto_input: String::new(),
             language: Language::Plain,
@@ -188,7 +245,26 @@ impl EditorState {
             use_tabs: false,
             show_whitespace: false,
             matching_bracket: None,
+            cursors: Vec::new(),
+            last_word_selection: None,
+            pending_exit: false,
+            visible_height: 20,  // 기본값, 렌더링 시 업데이트됨
+            visible_width: 80,   // 기본값, 렌더링 시 업데이트됨
+            message: None,
+            message_timer: 0,
         }
+    }
+
+    /// 메시지 설정 (지정된 프레임 수 동안 표시)
+    pub fn set_message(&mut self, msg: impl Into<String>, duration: u8) {
+        self.message = Some(msg.into());
+        self.message_timer = duration;
+    }
+
+    /// 메시지 클리어
+    pub fn clear_message(&mut self) {
+        self.message = None;
+        self.message_timer = 0;
     }
 
     /// Maximum file size for editing (50MB - more restrictive than viewer)
@@ -216,8 +292,11 @@ impl EditorState {
         self.modified = false;
         self.undo_stack.clear();
         self.redo_stack.clear();
+        self.undo_memory_usage = 0;
+        self.redo_memory_usage = 0;
         self.selection = None;
         self.find_mode = FindReplaceMode::None;
+        self.find_error = None;
 
         // 파일 읽기
         match fs::read_to_string(path) {
@@ -233,6 +312,9 @@ impl EditorState {
             }
         }
 
+        // 원본 상태 저장
+        self.original_lines = self.lines.clone();
+
         // 언어 감지
         self.language = Language::from_extension(path);
         self.highlighter = Some(SyntaxHighlighter::new(self.language));
@@ -241,37 +323,104 @@ impl EditorState {
     }
 
     /// 파일 저장
+    /// Security: Preserves original file permissions and uses atomic write
     pub fn save_file(&mut self) -> Result<(), String> {
+        // Save original permissions before writing
+        #[cfg(unix)]
+        let original_perms = fs::metadata(&self.file_path)
+            .map(|m| m.permissions())
+            .ok();
+
         let content = self.lines.join("\n");
-        fs::write(&self.file_path, content).map_err(|e| e.to_string())?;
+
+        // Use atomic write: write to temp file, then rename
+        let temp_path = self.file_path.with_extension("tmp");
+
+        // Write to temporary file
+        fs::write(&temp_path, &content).map_err(|e| {
+            format!("Failed to write temporary file: {}", e)
+        })?;
+
+        // Restore original permissions on temp file before rename
+        #[cfg(unix)]
+        if let Some(perms) = original_perms {
+            let _ = fs::set_permissions(&temp_path, perms);
+        }
+
+        // Atomic rename (on same filesystem)
+        fs::rename(&temp_path, &self.file_path).map_err(|e| {
+            // Clean up temp file on failure
+            let _ = fs::remove_file(&temp_path);
+            format!("Failed to save file: {}", e)
+        })?;
+
         self.modified = false;
+        self.original_lines = self.lines.clone();
         Ok(())
     }
 
-    /// Undo 액션 추가
+    /// 현재 상태와 원본을 비교하여 modified 플래그 업데이트
+    pub fn update_modified(&mut self) {
+        self.modified = self.lines != self.original_lines;
+    }
+
+    /// Undo 액션 추가 (with memory limit enforcement)
     pub fn push_undo(&mut self, action: EditAction) {
+        // Clear redo stack and its memory tracking
         self.redo_stack.clear();
-        self.undo_stack.push_back(action);
-        while self.undo_stack.len() > self.max_undo_size {
-            self.undo_stack.pop_front();
+        self.redo_memory_usage = 0;
+
+        let action_size = Self::estimate_action_size(&action);
+
+        // Enforce memory limit by removing oldest actions
+        while self.undo_memory_usage + action_size > self.max_undo_memory
+            && !self.undo_stack.is_empty()
+        {
+            if let Some(old_action) = self.undo_stack.pop_front() {
+                self.undo_memory_usage = self.undo_memory_usage
+                    .saturating_sub(Self::estimate_action_size(&old_action));
+            }
         }
+
+        // Also enforce count limit
+        while self.undo_stack.len() >= self.max_undo_size {
+            if let Some(old_action) = self.undo_stack.pop_front() {
+                self.undo_memory_usage = self.undo_memory_usage
+                    .saturating_sub(Self::estimate_action_size(&old_action));
+            }
+        }
+
+        self.undo_memory_usage += action_size;
+        self.undo_stack.push_back(action);
         self.modified = true;
     }
 
     /// Undo 실행
     pub fn undo(&mut self) {
         if let Some(action) = self.undo_stack.pop_back() {
+            let action_size = Self::estimate_action_size(&action);
+            self.undo_memory_usage = self.undo_memory_usage.saturating_sub(action_size);
+
             let reverse = self.reverse_action(&action);
             self.apply_action(&reverse, false);
+
+            self.redo_memory_usage += action_size;
             self.redo_stack.push_back(action);
+            self.update_modified();
         }
     }
 
     /// Redo 실행
     pub fn redo(&mut self) {
         if let Some(action) = self.redo_stack.pop_back() {
+            let action_size = Self::estimate_action_size(&action);
+            self.redo_memory_usage = self.redo_memory_usage.saturating_sub(action_size);
+
             self.apply_action(&action, false);
+
+            self.undo_memory_usage += action_size;
             self.undo_stack.push_back(action);
+            self.update_modified();
         }
     }
 
@@ -312,6 +461,10 @@ impl EditorState {
                 line: *line,
                 old_content: new_content.clone(),
                 new_content: old_content.clone(),
+            },
+            EditAction::SwapLines { line1, line2 } => EditAction::SwapLines {
+                line1: *line1,
+                line2: *line2,
             },
             EditAction::Batch { actions } => EditAction::Batch {
                 actions: actions.iter().rev().map(|a| self.reverse_action(a)).collect(),
@@ -381,6 +534,11 @@ impl EditorState {
                     self.lines[*line] = new_content.clone();
                 }
             }
+            EditAction::SwapLines { line1, line2 } => {
+                if *line1 < self.lines.len() && *line2 < self.lines.len() {
+                    self.lines.swap(*line1, *line2);
+                }
+            }
             EditAction::Batch { actions } => {
                 for a in actions {
                     self.apply_action(a, false);
@@ -409,15 +567,84 @@ impl EditorState {
         self.update_scroll();
     }
 
-    /// 문자열 삽입
+    /// 문자열 삽입 (단일 Undo 액션으로 처리)
     pub fn insert_str(&mut self, s: &str) {
-        for c in s.chars() {
-            if c == '\n' {
-                self.insert_newline();
-            } else {
-                self.insert_char(c);
-            }
+        if s.is_empty() {
+            return;
         }
+
+        // 선택 영역 삭제 (별도 Undo 액션으로 처리됨)
+        self.delete_selection();
+
+        // 시작 위치 저장
+        let start_line = self.cursor_line;
+        let start_col = self.cursor_col;
+
+        // 줄바꿈으로 분리
+        let parts: Vec<&str> = s.split('\n').collect();
+
+        if parts.len() == 1 {
+            // 단일 줄 삽입 (줄바꿈 없음)
+            let line = &mut self.lines[self.cursor_line];
+            let mut chars: Vec<char> = line.chars().collect();
+            for (i, c) in s.chars().enumerate() {
+                chars.insert(self.cursor_col + i, c);
+            }
+            *line = chars.into_iter().collect();
+            self.cursor_col += s.chars().count();
+
+            self.push_undo(EditAction::Insert {
+                line: start_line,
+                col: start_col,
+                text: s.to_string(),
+            });
+        } else {
+            // 여러 줄 삽입
+            let mut actions = Vec::new();
+
+            // 현재 줄의 커서 이후 부분 저장
+            let current_line = &self.lines[self.cursor_line];
+            let chars: Vec<char> = current_line.chars().collect();
+            let before: String = chars[..self.cursor_col].iter().collect();
+            let after: String = chars[self.cursor_col..].iter().collect();
+
+            // 첫 부분 + 첫 번째 삽입 텍스트
+            self.lines[self.cursor_line] = format!("{}{}", before, parts[0]);
+
+            // 중간 줄들 삽입
+            for (i, part) in parts.iter().enumerate().skip(1).take(parts.len() - 2) {
+                let new_line = part.to_string();
+                self.lines.insert(self.cursor_line + i, new_line.clone());
+                actions.push(EditAction::InsertLine {
+                    line: self.cursor_line + i,
+                    content: new_line,
+                });
+            }
+
+            // 마지막 줄 (마지막 삽입 텍스트 + 원래 커서 이후 부분)
+            let last_idx = parts.len() - 1;
+            let last_line = format!("{}{}", parts[last_idx], after);
+            self.lines.insert(self.cursor_line + last_idx, last_line.clone());
+            actions.push(EditAction::InsertLine {
+                line: self.cursor_line + last_idx,
+                content: last_line,
+            });
+
+            // 첫 줄 수정 기록
+            actions.insert(0, EditAction::Replace {
+                line: start_line,
+                old_content: format!("{}{}", before, after),
+                new_content: format!("{}{}", before, parts[0]),
+            });
+
+            // 커서 위치 업데이트
+            self.cursor_line = start_line + last_idx;
+            self.cursor_col = parts[last_idx].chars().count();
+
+            self.push_undo(EditAction::Batch { actions });
+        }
+
+        self.update_scroll();
     }
 
     /// 탭 삽입
@@ -563,6 +790,9 @@ impl EditorState {
             // 여러 줄 삭제
             let mut actions = Vec::new();
 
+            // 시작 줄 원본 저장
+            let first_line_original = self.lines[start_line].clone();
+
             // 시작 줄 처리
             let first_chars: Vec<char> = self.lines[start_line].chars().collect();
             let first_part: String = first_chars[..start_col].iter().collect();
@@ -571,7 +801,7 @@ impl EditorState {
             let last_chars: Vec<char> = self.lines[end_line].chars().collect();
             let last_part: String = last_chars[end_col..].iter().collect();
 
-            // 중간 줄들 저장 (undo용)
+            // 삭제할 줄들 저장 (undo용, 역순으로)
             for i in (start_line + 1..=end_line).rev() {
                 actions.push(EditAction::DeleteLine {
                     line: i,
@@ -580,7 +810,16 @@ impl EditorState {
             }
 
             // 줄 병합
-            self.lines[start_line] = format!("{}{}", first_part, last_part);
+            let new_first_line = format!("{}{}", first_part, last_part);
+
+            // 시작 줄 수정을 Replace로 저장 (Undo 시 원본 복원을 위해)
+            actions.push(EditAction::Replace {
+                line: start_line,
+                old_content: first_line_original,
+                new_content: new_first_line.clone(),
+            });
+
+            self.lines[start_line] = new_first_line;
 
             // 중간 줄들 제거
             for _ in start_line + 1..=end_line {
@@ -631,9 +870,14 @@ impl EditorState {
         }
     }
 
-    /// 복사
+    /// 복사 (선택 없으면 줄 전체)
     pub fn copy(&mut self) {
-        self.clipboard = self.get_selected_text();
+        if self.selection.is_some() && !self.selection.as_ref().unwrap().is_empty() {
+            self.clipboard = self.get_selected_text();
+        } else {
+            // 줄 전체 복사
+            self.clipboard = self.lines[self.cursor_line].clone() + "\n";
+        }
     }
 
     /// 잘라내기
@@ -677,6 +921,8 @@ impl EditorState {
             line: self.cursor_line,
             content: line_content,
         });
+        self.selection = None;
+        self.modified = true;
         self.update_scroll();
     }
 
@@ -694,6 +940,8 @@ impl EditorState {
                 self.cursor_line = self.lines.len() - 1;
             }
             self.cursor_col = self.cursor_col.min(self.lines[self.cursor_line].chars().count());
+            self.selection = None;
+            self.modified = true;
             self.update_scroll();
         }
     }
@@ -701,9 +949,11 @@ impl EditorState {
     /// 줄 위로 이동
     pub fn move_line_up(&mut self) {
         if self.cursor_line > 0 {
-            self.lines.swap(self.cursor_line, self.cursor_line - 1);
+            let line1 = self.cursor_line - 1;
+            let line2 = self.cursor_line;
+            self.lines.swap(line1, line2);
+            self.push_undo(EditAction::SwapLines { line1, line2 });
             self.cursor_line -= 1;
-            self.modified = true;
             self.update_scroll();
         }
     }
@@ -711,9 +961,11 @@ impl EditorState {
     /// 줄 아래로 이동
     pub fn move_line_down(&mut self) {
         if self.cursor_line + 1 < self.lines.len() {
-            self.lines.swap(self.cursor_line, self.cursor_line + 1);
+            let line1 = self.cursor_line;
+            let line2 = self.cursor_line + 1;
+            self.lines.swap(line1, line2);
+            self.push_undo(EditAction::SwapLines { line1, line2 });
             self.cursor_line += 1;
-            self.modified = true;
             self.update_scroll();
         }
     }
@@ -748,8 +1000,8 @@ impl EditorState {
                 // 다음 줄로 이동
                 self.cursor_line += 1;
                 self.cursor_col = 0;
-            } else if new_col > self.cursor_col && col_delta < 0 && self.cursor_line > 0 {
-                // 이전 줄 끝으로 이동
+            } else if self.cursor_col == 0 && col_delta < 0 && self.cursor_line > 0 {
+                // 줄 시작에서 왼쪽으로 이동 -> 이전 줄 끝으로
                 self.cursor_line -= 1;
                 self.cursor_col = self.lines[self.cursor_line].chars().count();
             } else {
@@ -811,19 +1063,17 @@ impl EditorState {
 
     /// 스크롤 업데이트
     pub fn update_scroll(&mut self) {
-        let visible_height = 20;
         if self.cursor_line < self.scroll {
             self.scroll = self.cursor_line;
-        } else if self.cursor_line >= self.scroll + visible_height {
-            self.scroll = self.cursor_line - visible_height + 1;
+        } else if self.cursor_line >= self.scroll + self.visible_height {
+            self.scroll = self.cursor_line.saturating_sub(self.visible_height - 1);
         }
 
         // 수평 스크롤
-        let visible_width = 80;
         if self.cursor_col < self.horizontal_scroll {
             self.horizontal_scroll = self.cursor_col;
-        } else if self.cursor_col >= self.horizontal_scroll + visible_width {
-            self.horizontal_scroll = self.cursor_col - visible_width + 1;
+        } else if self.cursor_col >= self.horizontal_scroll + self.visible_width {
+            self.horizontal_scroll = self.cursor_col.saturating_sub(self.visible_width - 1);
         }
     }
 
@@ -915,6 +1165,7 @@ impl EditorState {
     /// 검색 수행
     pub fn perform_find(&mut self) {
         self.match_positions.clear();
+        self.find_error = None;
 
         if self.find_term.is_empty() {
             return;
@@ -938,11 +1189,21 @@ impl EditorState {
             Regex::new(&format!("(?i){}", pattern))
         };
 
-        if let Ok(re) = regex {
-            for (line_idx, line) in self.lines.iter().enumerate() {
-                for mat in re.find_iter(line) {
-                    self.match_positions.push((line_idx, mat.start(), mat.end()));
+        match regex {
+            Ok(re) => {
+                for (line_idx, line) in self.lines.iter().enumerate() {
+                    for mat in re.find_iter(line) {
+                        // 바이트 인덱스를 문자 인덱스로 변환
+                        let byte_start = mat.start();
+                        let byte_end = mat.end();
+                        let char_start = line[..byte_start].chars().count();
+                        let char_end = char_start + line[byte_start..byte_end].chars().count();
+                        self.match_positions.push((line_idx, char_start, char_end));
+                    }
                 }
+            }
+            Err(e) => {
+                self.find_error = Some(format!("Regex error: {}", e));
             }
         }
 
@@ -1085,16 +1346,614 @@ impl EditorState {
             }
         }
     }
+
+    /// 문자가 단어 문자인지 확인
+    fn is_word_char(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
+    }
+
+    /// 단어 왼쪽으로 이동 (Ctrl+Left)
+    pub fn move_word_left(&mut self, extend_selection: bool) {
+        if extend_selection && self.selection.is_none() {
+            self.selection = Some(Selection::new(self.cursor_line, self.cursor_col));
+        } else if !extend_selection {
+            self.selection = None;
+        }
+
+        let line = &self.lines[self.cursor_line];
+        let chars: Vec<char> = line.chars().collect();
+
+        if self.cursor_col == 0 {
+            // 이전 줄 끝으로 이동
+            if self.cursor_line > 0 {
+                self.cursor_line -= 1;
+                self.cursor_col = self.lines[self.cursor_line].chars().count();
+            }
+        } else {
+            let mut col = self.cursor_col;
+            // 공백 건너뛰기
+            while col > 0 && !Self::is_word_char(chars[col - 1]) {
+                col -= 1;
+            }
+            // 단어 건너뛰기
+            while col > 0 && Self::is_word_char(chars[col - 1]) {
+                col -= 1;
+            }
+            self.cursor_col = col;
+        }
+
+        if let Some(ref mut sel) = self.selection {
+            sel.end_line = self.cursor_line;
+            sel.end_col = self.cursor_col;
+        }
+
+        self.update_scroll();
+    }
+
+    /// 단어 오른쪽으로 이동 (Ctrl+Right)
+    pub fn move_word_right(&mut self, extend_selection: bool) {
+        if extend_selection && self.selection.is_none() {
+            self.selection = Some(Selection::new(self.cursor_line, self.cursor_col));
+        } else if !extend_selection {
+            self.selection = None;
+        }
+
+        let line = &self.lines[self.cursor_line];
+        let chars: Vec<char> = line.chars().collect();
+        let line_len = chars.len();
+
+        if self.cursor_col >= line_len {
+            // 다음 줄 시작으로 이동
+            if self.cursor_line + 1 < self.lines.len() {
+                self.cursor_line += 1;
+                self.cursor_col = 0;
+            }
+        } else {
+            let mut col = self.cursor_col;
+            // 현재 단어 끝까지 이동
+            while col < line_len && Self::is_word_char(chars[col]) {
+                col += 1;
+            }
+            // 공백 건너뛰기
+            while col < line_len && !Self::is_word_char(chars[col]) {
+                col += 1;
+            }
+            self.cursor_col = col;
+        }
+
+        if let Some(ref mut sel) = self.selection {
+            sel.end_line = self.cursor_line;
+            sel.end_col = self.cursor_col;
+        }
+
+        self.update_scroll();
+    }
+
+    /// 단어 삭제 (뒤, Ctrl+Backspace)
+    pub fn delete_word_backward(&mut self) {
+        if self.selection.is_some() {
+            self.delete_selection();
+            return;
+        }
+
+        let line = &self.lines[self.cursor_line];
+        let chars: Vec<char> = line.chars().collect();
+
+        if self.cursor_col == 0 {
+            if self.cursor_line > 0 {
+                // 이전 줄과 병합
+                self.delete_backward();
+            }
+            return;
+        }
+
+        let start_col = self.cursor_col;
+        let mut col = self.cursor_col;
+
+        // 공백 건너뛰기
+        while col > 0 && !Self::is_word_char(chars[col - 1]) {
+            col -= 1;
+        }
+        // 단어 건너뛰기
+        while col > 0 && Self::is_word_char(chars[col - 1]) {
+            col -= 1;
+        }
+
+        let deleted_text: String = chars[col..start_col].iter().collect();
+        let new_line: String = chars[..col].iter().chain(chars[start_col..].iter()).collect();
+
+        self.push_undo(EditAction::Delete {
+            line: self.cursor_line,
+            col,
+            text: deleted_text,
+        });
+
+        self.lines[self.cursor_line] = new_line;
+        self.cursor_col = col;
+        self.update_scroll();
+    }
+
+    /// 단어 삭제 (앞, Ctrl+Delete)
+    pub fn delete_word_forward(&mut self) {
+        if self.selection.is_some() {
+            self.delete_selection();
+            return;
+        }
+
+        let line = &self.lines[self.cursor_line];
+        let chars: Vec<char> = line.chars().collect();
+        let line_len = chars.len();
+
+        if self.cursor_col >= line_len {
+            if self.cursor_line + 1 < self.lines.len() {
+                // 다음 줄과 병합
+                self.delete_forward();
+            }
+            return;
+        }
+
+        let start_col = self.cursor_col;
+        let mut col = self.cursor_col;
+
+        // 현재 단어 끝까지 이동
+        while col < line_len && Self::is_word_char(chars[col]) {
+            col += 1;
+        }
+        // 공백 건너뛰기
+        while col < line_len && !Self::is_word_char(chars[col]) {
+            col += 1;
+        }
+
+        let deleted_text: String = chars[start_col..col].iter().collect();
+        let new_line: String = chars[..start_col].iter().chain(chars[col..].iter()).collect();
+
+        self.push_undo(EditAction::Delete {
+            line: self.cursor_line,
+            col: start_col,
+            text: deleted_text,
+        });
+
+        self.lines[self.cursor_line] = new_line;
+        self.update_scroll();
+    }
+
+    /// 커서 위치의 단어 범위 찾기
+    fn get_word_at_cursor(&self) -> Option<(usize, usize, String)> {
+        let line = &self.lines[self.cursor_line];
+        let chars: Vec<char> = line.chars().collect();
+
+        if chars.is_empty() {
+            return None;
+        }
+
+        let col = self.cursor_col.min(chars.len().saturating_sub(1));
+
+        // 현재 위치가 단어 문자가 아니면 None
+        if !Self::is_word_char(chars[col]) {
+            return None;
+        }
+
+        // 단어 시작 찾기
+        let mut start = col;
+        while start > 0 && Self::is_word_char(chars[start - 1]) {
+            start -= 1;
+        }
+
+        // 단어 끝 찾기
+        let mut end = col;
+        while end < chars.len() && Self::is_word_char(chars[end]) {
+            end += 1;
+        }
+
+        let word: String = chars[start..end].iter().collect();
+        Some((start, end, word))
+    }
+
+    /// 커서 위치 단어 선택 (Ctrl+D 첫 번째)
+    pub fn select_word_at_cursor(&mut self) {
+        if let Some((start, end, word)) = self.get_word_at_cursor() {
+            self.selection = Some(Selection {
+                start_line: self.cursor_line,
+                start_col: start,
+                end_line: self.cursor_line,
+                end_col: end,
+            });
+            self.cursor_col = end;
+            self.last_word_selection = Some(word);
+            self.cursors.clear();
+        }
+    }
+
+    /// 다음 동일 단어 선택 (Ctrl+D 반복)
+    pub fn select_next_occurrence(&mut self) {
+        // 선택이 없으면 현재 단어 선택
+        if self.selection.is_none() || self.last_word_selection.is_none() {
+            self.select_word_at_cursor();
+            return;
+        }
+
+        let word = match &self.last_word_selection {
+            Some(w) => w.clone(),
+            None => return,
+        };
+
+        // 현재 커서 위치 이후에서 다음 occurrence 찾기
+        let search_start_line = self.cursor_line;
+        let search_start_col = self.cursor_col; // 문자 인덱스
+
+        for line_idx in search_start_line..self.lines.len() {
+            let line = &self.lines[line_idx];
+            let start_char_col = if line_idx == search_start_line { search_start_col } else { 0 };
+
+            // 문자 인덱스를 바이트 인덱스로 변환
+            let start_byte: usize = line.chars().take(start_char_col).map(|c| c.len_utf8()).sum();
+
+            // 이 줄에서 단어 찾기
+            if let Some(byte_pos) = line[start_byte..].find(&word) {
+                let actual_byte_pos = start_byte + byte_pos;
+                // 바이트 위치를 문자 위치로 변환
+                let char_pos = line[..actual_byte_pos].chars().count();
+
+                // 단어 경계 확인
+                let chars: Vec<char> = line.chars().collect();
+                let word_end = char_pos + word.chars().count();
+
+                let is_word_start = char_pos == 0 || !Self::is_word_char(chars[char_pos - 1]);
+                let is_word_end = word_end >= chars.len() || !Self::is_word_char(chars[word_end]);
+
+                if is_word_start && is_word_end {
+                    // 현재 선택 위치를 다중 커서에 추가
+                    if let Some(sel) = &self.selection {
+                        let (_, _, el, ec) = sel.normalized();
+                        self.cursors.push((el, ec));
+                    }
+
+                    // 새 위치로 선택 이동
+                    self.cursor_line = line_idx;
+                    self.cursor_col = word_end;
+                    self.selection = Some(Selection {
+                        start_line: line_idx,
+                        start_col: char_pos,
+                        end_line: line_idx,
+                        end_col: word_end,
+                    });
+                    self.update_scroll();
+                    return;
+                }
+            }
+        }
+
+        // 파일 끝에서 시작으로 wrap around
+        for line_idx in 0..=search_start_line {
+            let line = &self.lines[line_idx];
+
+            // 검색 범위 끝 계산 (바이트 인덱스)
+            let end_byte = if line_idx == search_start_line {
+                // 원래 검색 시작 전까지만
+                let sel = self.selection.as_ref().unwrap();
+                let (sl, sc, _, _) = sel.normalized();
+                let end_char = if line_idx == sl { sc } else { 0 };
+                line.chars().take(end_char).map(|c| c.len_utf8()).sum()
+            } else {
+                line.len()
+            };
+
+            if let Some(byte_pos) = line[..end_byte].find(&word) {
+                let char_pos = line[..byte_pos].chars().count();
+                let chars: Vec<char> = line.chars().collect();
+                let word_end = char_pos + word.chars().count();
+
+                let is_word_start = char_pos == 0 || !Self::is_word_char(chars[char_pos - 1]);
+                let is_word_end = word_end >= chars.len() || !Self::is_word_char(chars[word_end]);
+
+                if is_word_start && is_word_end {
+                    if let Some(sel) = &self.selection {
+                        let (_, _, el, ec) = sel.normalized();
+                        self.cursors.push((el, ec));
+                    }
+
+                    self.cursor_line = line_idx;
+                    self.cursor_col = word_end;
+                    self.selection = Some(Selection {
+                        start_line: line_idx,
+                        start_col: char_pos,
+                        end_line: line_idx,
+                        end_col: word_end,
+                    });
+                    self.update_scroll();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// 현재 줄 선택 (Ctrl+L)
+    pub fn select_line(&mut self) {
+        let line_len = self.lines[self.cursor_line].chars().count();
+        self.selection = Some(Selection {
+            start_line: self.cursor_line,
+            start_col: 0,
+            end_line: self.cursor_line,
+            end_col: line_len,
+        });
+        self.cursor_col = line_len;
+    }
+
+    /// 아래에 빈 줄 삽입 (Ctrl+Enter)
+    pub fn insert_line_below(&mut self) {
+        // 현재 줄의 들여쓰기 가져오기
+        let indent = if self.auto_indent {
+            let line = &self.lines[self.cursor_line];
+            line.chars().take_while(|c| c.is_whitespace()).collect::<String>()
+        } else {
+            String::new()
+        };
+
+        self.lines.insert(self.cursor_line + 1, indent.clone());
+        self.cursor_line += 1;
+        self.cursor_col = indent.len();
+
+        self.push_undo(EditAction::InsertLine {
+            line: self.cursor_line,
+            content: indent,
+        });
+        self.update_scroll();
+    }
+
+    /// 위에 빈 줄 삽입 (Ctrl+Shift+Enter)
+    pub fn insert_line_above(&mut self) {
+        // 현재 줄의 들여쓰기 가져오기
+        let indent = if self.auto_indent {
+            let line = &self.lines[self.cursor_line];
+            line.chars().take_while(|c| c.is_whitespace()).collect::<String>()
+        } else {
+            String::new()
+        };
+
+        self.lines.insert(self.cursor_line, indent.clone());
+        self.cursor_col = indent.len();
+
+        self.push_undo(EditAction::InsertLine {
+            line: self.cursor_line,
+            content: indent,
+        });
+        self.update_scroll();
+    }
+
+    /// 줄 복사 위로 (Shift+Alt+Up)
+    pub fn copy_line_up(&mut self) {
+        let line_content = self.lines[self.cursor_line].clone();
+        self.lines.insert(self.cursor_line, line_content.clone());
+
+        self.push_undo(EditAction::InsertLine {
+            line: self.cursor_line,
+            content: line_content,
+        });
+        self.update_scroll();
+    }
+
+    /// 줄 복사 아래로 (Shift+Alt+Down)
+    pub fn copy_line_down(&mut self) {
+        let line_content = self.lines[self.cursor_line].clone();
+        self.lines.insert(self.cursor_line + 1, line_content.clone());
+        self.cursor_line += 1;
+
+        self.push_undo(EditAction::InsertLine {
+            line: self.cursor_line,
+            content: line_content,
+        });
+        self.update_scroll();
+    }
+
+    /// 잘라내기 (선택 없으면 줄 전체)
+    pub fn cut_line_or_selection(&mut self) {
+        if self.selection.is_some() && !self.selection.as_ref().unwrap().is_empty() {
+            // 선택 영역 잘라내기
+            self.clipboard = self.get_selected_text();
+            self.delete_selection();
+        } else {
+            // 줄 전체 잘라내기
+            if self.lines.len() > 1 {
+                self.clipboard = self.lines[self.cursor_line].clone() + "\n";
+                let content = self.lines.remove(self.cursor_line);
+
+                self.push_undo(EditAction::DeleteLine {
+                    line: self.cursor_line,
+                    content,
+                });
+
+                if self.cursor_line >= self.lines.len() {
+                    self.cursor_line = self.lines.len() - 1;
+                }
+                self.cursor_col = self.cursor_col.min(self.lines[self.cursor_line].chars().count());
+            } else {
+                // 유일한 줄이면 내용만 잘라내기
+                self.clipboard = self.lines[0].clone() + "\n";
+                let old_content = self.lines[0].clone();
+                self.lines[0] = String::new();
+                self.cursor_col = 0;
+
+                self.push_undo(EditAction::Replace {
+                    line: 0,
+                    old_content,
+                    new_content: String::new(),
+                });
+            }
+            self.update_scroll();
+        }
+    }
+
+    /// 들여쓰기 (Ctrl+])
+    pub fn indent(&mut self) {
+        let indent_str = if self.use_tabs {
+            "\t".to_string()
+        } else {
+            " ".repeat(self.tab_size)
+        };
+
+        if let Some(sel) = &self.selection {
+            let (start_line, _, end_line, _) = sel.normalized();
+            let mut actions = Vec::new();
+
+            for line_idx in start_line..=end_line {
+                let old_content = self.lines[line_idx].clone();
+                self.lines[line_idx] = format!("{}{}", indent_str, old_content);
+                actions.push(EditAction::Replace {
+                    line: line_idx,
+                    old_content,
+                    new_content: self.lines[line_idx].clone(),
+                });
+            }
+
+            self.push_undo(EditAction::Batch { actions });
+        } else {
+            let old_content = self.lines[self.cursor_line].clone();
+            self.lines[self.cursor_line] = format!("{}{}", indent_str, old_content);
+            self.cursor_col += indent_str.len();
+
+            self.push_undo(EditAction::Replace {
+                line: self.cursor_line,
+                old_content,
+                new_content: self.lines[self.cursor_line].clone(),
+            });
+        }
+    }
+
+    /// 내어쓰기 (Ctrl+[ 또는 Shift+Tab)
+    pub fn outdent(&mut self) {
+        let tab_size = self.tab_size;
+
+        let remove_indent = |line: &str, tab_size: usize| -> (String, usize) {
+            let chars: Vec<char> = line.chars().collect();
+
+            if chars.first() == Some(&'\t') {
+                (chars[1..].iter().collect(), 1)
+            } else {
+                let spaces_to_remove = chars.iter().take(tab_size).take_while(|c| **c == ' ').count();
+                (chars[spaces_to_remove..].iter().collect(), spaces_to_remove)
+            }
+        };
+
+        if let Some(sel) = &self.selection {
+            let (start_line, _, end_line, _) = sel.normalized();
+            let mut actions = Vec::new();
+
+            for line_idx in start_line..=end_line {
+                let old_content = self.lines[line_idx].clone();
+                let (new_content, _) = remove_indent(&old_content, tab_size);
+                self.lines[line_idx] = new_content.clone();
+                actions.push(EditAction::Replace {
+                    line: line_idx,
+                    old_content,
+                    new_content,
+                });
+            }
+
+            self.push_undo(EditAction::Batch { actions });
+        } else {
+            let old_content = self.lines[self.cursor_line].clone();
+            let (new_content, removed) = remove_indent(&old_content, tab_size);
+            self.lines[self.cursor_line] = new_content.clone();
+            self.cursor_col = self.cursor_col.saturating_sub(removed);
+
+            self.push_undo(EditAction::Replace {
+                line: self.cursor_line,
+                old_content,
+                new_content,
+            });
+        }
+    }
+
+    /// 언어별 주석 문자 가져오기
+    fn get_comment_string(&self) -> Option<&'static str> {
+        match self.language {
+            Language::Rust | Language::C | Language::Cpp |
+            Language::Java | Language::JavaScript | Language::TypeScript |
+            Language::Go | Language::Swift | Language::Kotlin => Some("//"),
+
+            Language::Python | Language::Shell | Language::Ruby |
+            Language::Yaml | Language::Toml => Some("#"),
+
+            Language::Sql => Some("--"),
+
+            Language::Html | Language::Xml | Language::Css => None,
+
+            Language::Php => Some("//"),
+
+            Language::Markdown | Language::Json | Language::Plain => Some("//"),
+        }
+    }
+
+    /// 주석 토글 (Ctrl+/)
+    pub fn toggle_comment(&mut self) {
+        let comment = match self.get_comment_string() {
+            Some(c) => c,
+            None => return,
+        };
+        let comment_with_space = format!("{} ", comment);
+
+        if let Some(sel) = &self.selection {
+            let (start_line, _, end_line, _) = sel.normalized();
+            let mut actions = Vec::new();
+
+            // 모든 줄이 주석인지 확인 (라인 맨 앞 기준)
+            let all_commented = (start_line..=end_line).all(|i| {
+                self.lines[i].starts_with(&comment_with_space) || self.lines[i].starts_with(comment)
+            });
+
+            for line_idx in start_line..=end_line {
+                let old_content = self.lines[line_idx].clone();
+
+                let new_content = if all_commented {
+                    // 주석 제거 (라인 맨 앞에서)
+                    if old_content.starts_with(&comment_with_space) {
+                        old_content[comment_with_space.len()..].to_string()
+                    } else if old_content.starts_with(comment) {
+                        old_content[comment.len()..].to_string()
+                    } else {
+                        old_content.clone()
+                    }
+                } else {
+                    // 주석 추가 (라인 맨 앞에)
+                    format!("{}{}", comment_with_space, old_content)
+                };
+
+                self.lines[line_idx] = new_content.clone();
+                actions.push(EditAction::Replace {
+                    line: line_idx,
+                    old_content,
+                    new_content,
+                });
+            }
+
+            self.push_undo(EditAction::Batch { actions });
+        } else {
+            let old_content = self.lines[self.cursor_line].clone();
+
+            let new_content = if old_content.starts_with(&comment_with_space) {
+                // 주석 제거 (라인 맨 앞에서)
+                old_content[comment_with_space.len()..].to_string()
+            } else if old_content.starts_with(comment) {
+                old_content[comment.len()..].to_string()
+            } else {
+                // 주석 추가 (라인 맨 앞에)
+                format!("{}{}", comment_with_space, old_content)
+            };
+
+            self.lines[self.cursor_line] = new_content.clone();
+
+            self.push_undo(EditAction::Replace {
+                line: self.cursor_line,
+                old_content,
+                new_content,
+            });
+        }
+    }
 }
 
-pub fn draw(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
-    let state = match &app.editor_state {
-        Some(s) => s,
-        None => return,
-    };
-
+pub fn draw(frame: &mut Frame, state: &mut EditorState, area: Rect, theme: &Theme) {
     let border_color = if state.modified {
-        theme.warning
+        theme.shortcut_key
     } else {
         theme.border_active
     };
@@ -1110,6 +1969,10 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         return;
     }
 
+    // 화면 크기 업데이트 (스크롤 계산에 사용)
+    state.visible_height = inner.height.saturating_sub(2) as usize; // 헤더와 푸터 제외
+    // visible_width는 Content 섹션에서 동적 줄 번호 폭 기준으로 설정됨
+
     // Header
     let file_name = state
         .file_path
@@ -1118,12 +1981,14 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         .unwrap_or_else(|| "New File".to_string());
 
     let header = Line::from(vec![
+        Span::raw(" "),
+        if state.modified {
+            Span::styled("✻", Style::default().fg(theme.editor.modified_mark))
+        } else {
+            Span::raw("")
+        },
         Span::styled(
-            format!(
-                " {}{} ",
-                if state.modified { "*" } else { "" },
-                file_name
-            ),
+            format!("{} ", file_name),
             theme.header_style(),
         ),
         Span::styled(
@@ -1136,8 +2001,8 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         ),
         if !state.undo_stack.is_empty() {
             Span::styled(
-                format!("[Undo:{}] ", state.undo_stack.len()),
-                Style::default().fg(theme.info),
+                format!("Undo:{} ", state.undo_stack.len()),
+                theme.dim_style(),
             )
         } else {
             Span::raw("")
@@ -1150,7 +2015,18 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
 
     // Content
     let content_height = (inner.height - 2) as usize;
-    let _content_width = (inner.width - 6) as usize;
+
+    // 줄 번호 폭 동적 계산 (총 줄 수 기준)
+    let total_lines = state.lines.len();
+    let line_num_width = if total_lines == 0 {
+        1
+    } else {
+        ((total_lines as f64).log10().floor() as usize) + 1
+    }.max(4); // 최소 4자리
+    let line_num_col_width = line_num_width + 1; // 공백 포함
+
+    // visible_width 업데이트
+    state.visible_width = inner.width.saturating_sub(line_num_col_width as u16 + 1) as usize;
 
     // 선택 영역 정규화
     let selection = state.selection.as_ref().map(|s| s.normalized());
@@ -1177,9 +2053,13 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
             theme.dim_style()
         };
 
-        let line_num_span = Span::styled(format!("{:4} ", line_num + 1), line_num_style);
+        let line_num_span = Span::styled(
+            format!("{:>width$} ", line_num + 1, width = line_num_width),
+            line_num_style,
+        );
 
         // 라인 렌더링
+        let in_find_mode = state.find_mode != FindReplaceMode::None;
         let content_spans = render_editor_line(
             line,
             line_num,
@@ -1188,6 +2068,9 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
             &mut highlighter,
             theme,
             is_cursor_line,
+            in_find_mode,
+            state.horizontal_scroll,
+            state.visible_width,
         );
 
         let mut spans = vec![line_num_span];
@@ -1239,20 +2122,16 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
             } else {
                 let mut footer_spans = vec![];
 
-                if state.modified {
-                    footer_spans.push(Span::styled("Modified ", theme.warning_style()));
-                }
-
-                // Ctrl 단축키: ^키 강조 + 나머지 dim
+                // 단축키 안내
                 let shortcuts = [
-                    ("^S", "ave "),
-                    ("^Q", "uit "),
-                    ("^X", "discard "),
-                    ("^Z", "undo "),
-                    ("^Y", "redo "),
-                    ("^F", "ind "),
-                    ("^G", "oto "),
-                    ("^D", "up"),
+                    ("^S", " save "),
+                    ("^K", " del "),
+                    ("^J", " dup "),
+                    ("^/", " comment "),
+                    ("^D", " select "),
+                    ("^F", " find "),
+                    ("^G", " goto "),
+                    ("Esc", " exit"),
                 ];
 
                 for (key, rest) in shortcuts {
@@ -1275,54 +2154,130 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
                 if state.find_options.whole_word { " W" } else { "" }
             );
 
-            let match_info = if !state.match_positions.is_empty() {
-                format!(
-                    " {}/{} ",
+            let (match_info, match_info_style) = if let Some(ref err) = state.find_error {
+                // 정규식 에러 표시 (빨간색)
+                let truncated = if err.len() > 30 {
+                    format!(" {}... ", &err[..27])
+                } else {
+                    format!(" {} ", err)
+                };
+                (truncated, Style::default().fg(Color::Red))
+            } else if !state.match_positions.is_empty() {
+                let count = state.match_positions.len();
+                (format!(
+                    " {}/{} ({} matches) ",
                     state.current_match + 1,
-                    state.match_positions.len()
-                )
+                    count,
+                    count
+                ), theme.dim_style())
+            } else if !state.find_term.is_empty() {
+                (" No matches ".to_string(), theme.dim_style())
             } else {
-                " 0/0 ".to_string()
+                (String::new(), theme.dim_style())
             };
 
-            let mut spans = vec![
-                Span::styled("Find: ", theme.header_style()),
-                Span::styled(
-                    &state.find_input,
-                    if state.input_focus == 0 {
-                        theme.normal_style()
-                    } else {
-                        theme.dim_style()
-                    },
-                ),
-            ];
+            let cursor_style = Style::default()
+                .fg(theme.bg)
+                .bg(theme.bg_selected)
+                .add_modifier(Modifier::SLOW_BLINK);
+            let input_style = Style::default().fg(theme.bg_selected);
 
+            // Find 입력 필드
+            let find_chars: Vec<char> = state.find_input.chars().collect();
+            let find_cursor = state.find_cursor_pos.min(find_chars.len());
+            let find_before: String = find_chars[..find_cursor].iter().collect();
+            let find_cursor_char = if find_cursor < find_chars.len() {
+                find_chars[find_cursor].to_string()
+            } else {
+                " ".to_string()
+            };
+            let find_after: String = if find_cursor < find_chars.len() {
+                let mut s: String = find_chars[find_cursor + 1..].iter().collect();
+                s.push(' '); // 끝에 공백 유지
+                s
+            } else {
+                String::new()
+            };
+
+            let mut spans = vec![Span::styled("Find: ", theme.header_style())];
             if state.input_focus == 0 {
-                spans.push(Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)));
+                spans.push(Span::styled(find_before, input_style));
+                spans.push(Span::styled(find_cursor_char, cursor_style));
+                spans.push(Span::styled(find_after, input_style));
+            } else {
+                spans.push(Span::styled(format!("{} ", &state.find_input), theme.dim_style()));
             }
 
+            // Replace 입력 필드
             if state.find_mode == FindReplaceMode::Replace {
+                let replace_chars: Vec<char> = state.replace_input.chars().collect();
+                let replace_cursor = state.replace_cursor_pos.min(replace_chars.len());
+                let replace_before: String = replace_chars[..replace_cursor].iter().collect();
+                let replace_cursor_char = if replace_cursor < replace_chars.len() {
+                    replace_chars[replace_cursor].to_string()
+                } else {
+                    " ".to_string()
+                };
+                let replace_after: String = if replace_cursor < replace_chars.len() {
+                    let mut s: String = replace_chars[replace_cursor + 1..].iter().collect();
+                    s.push(' '); // 끝에 공백 유지
+                    s
+                } else {
+                    String::new()
+                };
+
                 spans.push(Span::styled(" Replace: ", theme.header_style()));
-                spans.push(Span::styled(
-                    &state.replace_input,
-                    if state.input_focus == 1 {
-                        theme.normal_style()
-                    } else {
-                        theme.dim_style()
-                    },
-                ));
                 if state.input_focus == 1 {
-                    spans.push(Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)));
+                    spans.push(Span::styled(replace_before, input_style));
+                    spans.push(Span::styled(replace_cursor_char, cursor_style));
+                    spans.push(Span::styled(replace_after, input_style));
+                } else {
+                    spans.push(Span::styled(format!("{} ", &state.replace_input), theme.dim_style()));
                 }
             }
 
-            spans.push(Span::styled(match_info, theme.success_style()));
+            spans.push(Span::styled(match_info, match_info_style));
             spans.push(Span::styled(find_opts, theme.dim_style()));
+
+            // 단축키 안내 (VSCode 스타일)
+            spans.push(Span::styled(" ^C", theme.header_style()));
+            spans.push(Span::styled("ase ", theme.dim_style()));
+            spans.push(Span::styled("^R", theme.header_style()));
+            spans.push(Span::styled("egex ", theme.dim_style()));
+            spans.push(Span::styled("^W", theme.header_style()));
+            spans.push(Span::styled("ord ", theme.dim_style()));
+            if state.find_mode == FindReplaceMode::Replace {
+                spans.push(Span::styled("^A", theme.header_style()));
+                spans.push(Span::styled("ll ", theme.dim_style()));
+                spans.push(Span::styled("Tab", theme.header_style()));
+                spans.push(Span::styled(" ", theme.dim_style()));
+            }
+            spans.push(Span::styled("Esc", theme.header_style()));
 
             frame.render_widget(
                 Paragraph::new(Line::from(spans)).style(theme.status_bar_style()),
                 Rect::new(inner.x, footer_y, inner.width, 1),
             );
+        }
+    }
+
+    // 메시지 표시 (화면 상단에 오버레이)
+    if let Some(ref msg) = state.message {
+        let msg_width = (msg.len() + 4).min(inner.width as usize) as u16;
+        let msg_x = inner.x + (inner.width.saturating_sub(msg_width)) / 2;
+        let msg_y = inner.y + 1;
+        frame.render_widget(
+            Paragraph::new(format!(" {} ", msg))
+                .style(Style::default().fg(theme.message.text).bg(theme.message.bg)),
+            Rect::new(msg_x, msg_y, msg_width, 1),
+        );
+    }
+
+    // 메시지 타이머 업데이트
+    if state.message_timer > 0 {
+        state.message_timer -= 1;
+        if state.message_timer == 0 {
+            state.message = None;
         }
     }
 }
@@ -1336,9 +2291,16 @@ fn render_editor_line(
     highlighter: &mut Option<SyntaxHighlighter>,
     theme: &Theme,
     is_cursor_line: bool,
+    in_find_mode: bool,
+    horizontal_scroll: usize,
+    visible_width: usize,
 ) -> Vec<Span<'static>> {
     let chars: Vec<char> = line.chars().collect();
     let mut spans: Vec<Span<'static>> = Vec::new();
+
+    // 보이는 범위 계산
+    let view_start = horizontal_scroll;
+    let view_end = (horizontal_scroll + visible_width).min(chars.len());
 
     // 선택 영역이 이 줄에 있는지 확인
     let line_selection = if let Some((sl, sc, el, ec)) = selection {
@@ -1371,6 +2333,15 @@ fn render_editor_line(
 
             for (i, c) in token_chars.iter().enumerate() {
                 let pos = token_start + i;
+
+                // 보이는 범위 밖이면 건너뛰기
+                if pos < view_start {
+                    continue;
+                }
+                if pos >= view_end {
+                    break;
+                }
+
                 let mut style = if let Some(ref mut hl) = highlighter {
                     hl.style_for(token.token_type)
                 } else {
@@ -1380,14 +2351,18 @@ fn render_editor_line(
                 // 선택 영역 하이라이트
                 if let Some((sel_start, sel_end)) = line_selection {
                     if pos >= sel_start && pos < sel_end {
-                        style = style.bg(theme.bg_selected);
+                        style = style.bg(theme.editor.selection_bg).fg(theme.editor.selection_text);
                     }
                 }
 
                 // 검색 매치 하이라이트
-                for (ml, ms, me) in &state.match_positions {
+                for (idx, (ml, ms, me)) in state.match_positions.iter().enumerate() {
                     if *ml == line_num && pos >= *ms && pos < *me {
-                        style = style.bg(theme.warning);
+                        if idx == state.current_match {
+                            style = style.bg(theme.bg_selected).fg(theme.bg);
+                        } else {
+                            style = style.bg(theme.shortcut_key).fg(theme.bg);
+                        }
                     }
                 }
 
@@ -1400,7 +2375,11 @@ fn render_editor_line(
 
                 // 커서 하이라이트
                 if is_cursor_line && pos == state.cursor_col && state.selection.is_none() {
-                    style = theme.selected_style();
+                    if in_find_mode {
+                        style = Style::default().fg(theme.text).bg(theme.bg_status_bar);
+                    } else {
+                        style = theme.selected_style();
+                    }
                 }
 
                 spans.push(Span::styled(c.to_string(), style));
@@ -1409,26 +2388,38 @@ fn render_editor_line(
             char_idx = token_end;
         }
 
-        // 커서가 줄 끝에 있는 경우
+        // 커서가 줄 끝에 있고 보이는 범위 내인 경우
         if is_cursor_line && state.cursor_col >= chars.len() && state.selection.is_none() {
-            spans.push(Span::styled(" ", theme.selected_style()));
+            if state.cursor_col >= view_start && state.cursor_col < view_start + visible_width {
+                let cursor_style = if in_find_mode {
+                    Style::default().fg(theme.text).bg(theme.bg_status_bar)
+                } else {
+                    theme.selected_style()
+                };
+                spans.push(Span::styled(" ", cursor_style));
+            }
         }
     } else {
-        // 토큰 없이 문자 단위 렌더링
-        for (i, c) in chars.iter().enumerate() {
+        // 토큰 없이 문자 단위 렌더링 (보이는 범위만)
+        for i in view_start..view_end {
+            let c = chars[i];
             let mut style = theme.normal_style();
 
             // 선택 영역
             if let Some((sel_start, sel_end)) = line_selection {
                 if i >= sel_start && i < sel_end {
-                    style = style.bg(theme.bg_selected);
+                    style = style.bg(theme.editor.selection_bg).fg(theme.editor.selection_text);
                 }
             }
 
             // 검색 매치
-            for (ml, ms, me) in &state.match_positions {
+            for (idx, (ml, ms, me)) in state.match_positions.iter().enumerate() {
                 if *ml == line_num && i >= *ms && i < *me {
-                    style = style.bg(theme.warning);
+                    if idx == state.current_match {
+                        style = style.bg(theme.bg_selected).fg(theme.bg);
+                    } else {
+                        style = style.bg(theme.shortcut_key).fg(theme.bg);
+                    }
                 }
             }
 
@@ -1441,23 +2432,39 @@ fn render_editor_line(
 
             // 커서
             if is_cursor_line && i == state.cursor_col && state.selection.is_none() {
-                style = theme.selected_style();
+                if in_find_mode {
+                    style = Style::default().fg(theme.text).bg(theme.bg_status_bar);
+                } else {
+                    style = theme.selected_style();
+                }
             }
 
             spans.push(Span::styled(c.to_string(), style));
         }
 
-        // 커서가 줄 끝에 있는 경우
+        // 커서가 줄 끝에 있고 보이는 범위 내인 경우
         if is_cursor_line && state.cursor_col >= chars.len() && state.selection.is_none() {
-            spans.push(Span::styled(" ", theme.selected_style()));
+            if state.cursor_col >= view_start && state.cursor_col < view_start + visible_width {
+                let cursor_style = if in_find_mode {
+                    Style::default().fg(theme.text).bg(theme.bg_status_bar)
+                } else {
+                    theme.selected_style()
+                };
+                spans.push(Span::styled(" ", cursor_style));
+            }
         }
     }
 
     if spans.is_empty() {
-        // 빈 줄에 커서 표시
-        if is_cursor_line && state.selection.is_none() {
-            spans.push(Span::styled(" ", theme.selected_style()));
-        } else {
+        // 빈 줄에 커서 표시 (수평 스크롤이 0일 때만)
+        if is_cursor_line && state.selection.is_none() && horizontal_scroll == 0 {
+            let cursor_style = if in_find_mode {
+                Style::default().fg(theme.text).bg(theme.bg_status_bar)
+            } else {
+                theme.selected_style()
+            };
+            spans.push(Span::styled(" ", cursor_style));
+        } else if horizontal_scroll == 0 {
             spans.push(Span::styled(" ", theme.normal_style()));
         }
     }
@@ -1470,6 +2477,11 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         Some(s) => s,
         None => return,
     };
+
+    // pending_exit 상태 초기화 (Esc 외의 키 입력 시)
+    if code != KeyCode::Esc {
+        state.pending_exit = false;
+    }
 
     // Goto 모드
     if state.goto_mode {
@@ -1500,12 +2512,19 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             KeyCode::Esc => {
                 state.find_mode = FindReplaceMode::None;
                 state.selection = None;
+                state.match_positions.clear();
             }
             KeyCode::Tab if state.find_mode == FindReplaceMode::Replace => {
                 state.input_focus = 1 - state.input_focus;
+                if state.input_focus == 0 {
+                    state.find_cursor_pos = state.find_input.chars().count();
+                } else {
+                    state.replace_cursor_pos = state.replace_input.chars().count();
+                }
             }
             KeyCode::Enter => {
                 if state.input_focus == 0 {
+                    // 검색 필드에서 Enter - 항상 새로 검색
                     state.find_term = state.find_input.clone();
                     state.perform_find();
                 } else if state.find_mode == FindReplaceMode::Replace {
@@ -1514,38 +2533,107 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             }
             KeyCode::Backspace => {
                 if state.input_focus == 0 {
-                    state.find_input.pop();
-                } else {
-                    state.replace_input.pop();
+                    if state.find_cursor_pos > 0 {
+                        let mut chars: Vec<char> = state.find_input.chars().collect();
+                        chars.remove(state.find_cursor_pos - 1);
+                        state.find_input = chars.into_iter().collect();
+                        state.find_cursor_pos -= 1;
+                    }
+                } else if state.replace_cursor_pos > 0 {
+                    let mut chars: Vec<char> = state.replace_input.chars().collect();
+                    chars.remove(state.replace_cursor_pos - 1);
+                    state.replace_input = chars.into_iter().collect();
+                    state.replace_cursor_pos -= 1;
                 }
             }
-            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Delete => {
+                if state.input_focus == 0 {
+                    let char_count = state.find_input.chars().count();
+                    if state.find_cursor_pos < char_count {
+                        let mut chars: Vec<char> = state.find_input.chars().collect();
+                        chars.remove(state.find_cursor_pos);
+                        state.find_input = chars.into_iter().collect();
+                    }
+                } else {
+                    let char_count = state.replace_input.chars().count();
+                    if state.replace_cursor_pos < char_count {
+                        let mut chars: Vec<char> = state.replace_input.chars().collect();
+                        chars.remove(state.replace_cursor_pos);
+                        state.replace_input = chars.into_iter().collect();
+                    }
+                }
+            }
+            KeyCode::Left => {
+                if state.input_focus == 0 {
+                    if state.find_cursor_pos > 0 {
+                        state.find_cursor_pos -= 1;
+                    }
+                } else if state.replace_cursor_pos > 0 {
+                    state.replace_cursor_pos -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if state.input_focus == 0 {
+                    if state.find_cursor_pos < state.find_input.chars().count() {
+                        state.find_cursor_pos += 1;
+                    }
+                } else if state.replace_cursor_pos < state.replace_input.chars().count() {
+                    state.replace_cursor_pos += 1;
+                }
+            }
+            KeyCode::Home => {
+                if state.input_focus == 0 {
+                    state.find_cursor_pos = 0;
+                } else {
+                    state.replace_cursor_pos = 0;
+                }
+            }
+            KeyCode::End => {
+                if state.input_focus == 0 {
+                    state.find_cursor_pos = state.find_input.chars().count();
+                } else {
+                    state.replace_cursor_pos = state.replace_input.chars().count();
+                }
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') if modifiers.contains(KeyModifiers::CONTROL) => {
                 state.find_options.case_sensitive = !state.find_options.case_sensitive;
+                state.find_term = state.find_input.clone();
+                state.perform_find();
             }
-            KeyCode::Char('r') if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('r') | KeyCode::Char('R') if modifiers.contains(KeyModifiers::CONTROL) => {
                 state.find_options.use_regex = !state.find_options.use_regex;
+                state.find_term = state.find_input.clone();
+                state.perform_find();
             }
-            KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('w') | KeyCode::Char('W') if modifiers.contains(KeyModifiers::CONTROL) => {
                 state.find_options.whole_word = !state.find_options.whole_word;
+                state.find_term = state.find_input.clone();
+                state.perform_find();
             }
-            KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('a') | KeyCode::Char('A') if modifiers.contains(KeyModifiers::CONTROL) => {
                 // 모두 바꾸기
                 if state.find_mode == FindReplaceMode::Replace {
                     state.find_term = state.find_input.clone();
                     state.replace_all();
                 }
             }
-            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
-                state.find_next();
-            }
-            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
-                state.find_prev();
-            }
-            KeyCode::Char(c) => {
-                if state.input_focus == 0 {
-                    state.find_input.push(c);
+            KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                // Shift 처리: 일부 터미널에서 Shift+문자가 소문자로 올 수 있음
+                let ch = if modifiers.contains(KeyModifiers::SHIFT) && c.is_ascii_lowercase() {
+                    c.to_ascii_uppercase()
                 } else {
-                    state.replace_input.push(c);
+                    c
+                };
+                if state.input_focus == 0 {
+                    let mut chars: Vec<char> = state.find_input.chars().collect();
+                    chars.insert(state.find_cursor_pos, ch);
+                    state.find_input = chars.into_iter().collect();
+                    state.find_cursor_pos += 1;
+                } else {
+                    let mut chars: Vec<char> = state.replace_input.chars().collect();
+                    chars.insert(state.replace_cursor_pos, ch);
+                    state.replace_input = chars.into_iter().collect();
+                    state.replace_cursor_pos += 1;
                 }
             }
             KeyCode::Down => {
@@ -1565,7 +2653,15 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             KeyCode::Char('s') => {
                 match state.save_file() {
                     Ok(_) => {
-                        app.show_message("File saved!");
+                        state.pending_exit = false;
+                        if App::is_settings_file(&state.file_path) {
+                            if app.reload_settings() {
+                                app.show_message("Settings saved and applied!");
+                            }
+                            // If reload_settings fails, it shows its own error message
+                        } else {
+                            app.show_message("File saved!");
+                        }
                         app.refresh_panels();
                     }
                     Err(e) => {
@@ -1574,26 +2670,9 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                 }
                 return;
             }
-            KeyCode::Char('q') => {
-                if !state.modified {
-                    app.current_screen = Screen::DualPanel;
-                } else {
-                    app.show_message("Unsaved changes! ^S to save, ^X to discard");
-                }
-                return;
-            }
             KeyCode::Char('x') => {
-                // Discard changes - go back to previous screen (viewer) or dual panel
-                if let Some(Screen::FileViewer) = app.previous_screen {
-                    // 에디터의 커서 위치를 뷰어에 전달
-                    if let Some(ref mut viewer) = app.viewer_state {
-                        viewer.scroll = state.scroll;
-                    }
-                    app.previous_screen = None;
-                    app.current_screen = Screen::FileViewer;
-                } else {
-                    app.current_screen = Screen::DualPanel;
-                }
+                // Ctrl+X: 잘라내기 (선택 없으면 줄 전체)
+                state.cut_line_or_selection();
                 return;
             }
             KeyCode::Char('z') => {
@@ -1616,22 +2695,82 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                 state.paste();
                 return;
             }
-            KeyCode::Char('d') => {
+            KeyCode::Char('k') => {
+                // Ctrl+K: 줄 삭제
+                state.delete_line();
+                return;
+            }
+            KeyCode::Char('j') => {
+                // Ctrl+J: 줄 복제
                 state.duplicate_line();
                 return;
             }
-            KeyCode::Char('k') => {
-                state.delete_line();
+            KeyCode::Char('d') => {
+                // Ctrl+D: 단어 선택 / 다중 선택
+                state.select_next_occurrence();
+                return;
+            }
+            KeyCode::Char('l') => {
+                // Ctrl+L: 현재 줄 선택
+                state.select_line();
+                return;
+            }
+            KeyCode::Char('/') | KeyCode::Char('_') | KeyCode::Char('7') => {
+                // Ctrl+/: 주석 토글
+                // 일부 터미널에서 Ctrl+_ 또는 Ctrl+7로 전달됨
+                state.toggle_comment();
+                return;
+            }
+            KeyCode::Char(']') => {
+                // Ctrl+]: 들여쓰기
+                state.indent();
+                return;
+            }
+            // Ctrl+[는 터미널에서 ESC로 해석되어 작동 안 함
+            // 내어쓰기는 Shift+Tab 사용 (아래 KeyCode::Tab 참조)
+            KeyCode::Enter => {
+                if modifiers.contains(KeyModifiers::SHIFT) {
+                    // Ctrl+Shift+Enter: 위에 빈 줄 삽입
+                    state.insert_line_above();
+                } else {
+                    // Ctrl+Enter: 아래에 빈 줄 삽입
+                    state.insert_line_below();
+                }
+                return;
+            }
+            KeyCode::Left => {
+                // Ctrl+Left: 단어 이동 왼쪽 (Shift 있으면 선택)
+                let extend_sel = modifiers.contains(KeyModifiers::SHIFT);
+                state.move_word_left(extend_sel);
+                return;
+            }
+            KeyCode::Right => {
+                // Ctrl+Right: 단어 이동 오른쪽 (Shift 있으면 선택)
+                let extend_sel = modifiers.contains(KeyModifiers::SHIFT);
+                state.move_word_right(extend_sel);
+                return;
+            }
+            KeyCode::Backspace => {
+                // Ctrl+Backspace: 단어 삭제 (뒤)
+                state.delete_word_backward();
+                return;
+            }
+            KeyCode::Delete => {
+                // Ctrl+Delete: 단어 삭제 (앞)
+                state.delete_word_forward();
                 return;
             }
             KeyCode::Char('f') => {
                 state.find_mode = FindReplaceMode::Find;
                 state.input_focus = 0;
+                state.find_cursor_pos = state.find_input.chars().count();
                 return;
             }
             KeyCode::Char('h') => {
                 state.find_mode = FindReplaceMode::Replace;
                 state.input_focus = 0;
+                state.find_cursor_pos = state.find_input.chars().count();
+                state.replace_cursor_pos = state.replace_input.chars().count();
                 return;
             }
             KeyCode::Char('g') => {
@@ -1640,18 +2779,40 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                 return;
             }
             KeyCode::Home => {
-                // 파일 시작으로
+                // 파일 시작으로 (Shift 있으면 선택)
+                let extend_sel = modifiers.contains(KeyModifiers::SHIFT);
+                if extend_sel {
+                    if state.selection.is_none() {
+                        state.selection = Some(Selection::new(state.cursor_line, state.cursor_col));
+                    }
+                } else {
+                    state.selection = None;
+                }
                 state.cursor_line = 0;
                 state.cursor_col = 0;
-                state.selection = None;
+                if let Some(ref mut sel) = state.selection {
+                    sel.end_line = state.cursor_line;
+                    sel.end_col = state.cursor_col;
+                }
                 state.update_scroll();
                 return;
             }
             KeyCode::End => {
-                // 파일 끝으로
+                // 파일 끝으로 (Shift 있으면 선택)
+                let extend_sel = modifiers.contains(KeyModifiers::SHIFT);
+                if extend_sel {
+                    if state.selection.is_none() {
+                        state.selection = Some(Selection::new(state.cursor_line, state.cursor_col));
+                    }
+                } else {
+                    state.selection = None;
+                }
                 state.cursor_line = state.lines.len().saturating_sub(1);
                 state.cursor_col = state.lines[state.cursor_line].chars().count();
-                state.selection = None;
+                if let Some(ref mut sel) = state.selection {
+                    sel.end_line = state.cursor_line;
+                    sel.end_col = state.cursor_col;
+                }
                 state.update_scroll();
                 return;
             }
@@ -1659,8 +2820,8 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         }
     }
 
-    // Alt 조합
-    if modifiers.contains(KeyModifiers::ALT) {
+    // Alt 조합 (줄 이동)
+    if modifiers.contains(KeyModifiers::ALT) && !modifiers.contains(KeyModifiers::SHIFT) {
         match code {
             KeyCode::Up => {
                 state.move_line_up();
@@ -1680,15 +2841,36 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     match code {
         KeyCode::Esc => {
             if state.selection.is_some() {
+                // 선택 해제 및 다중 커서 초기화
                 state.selection = None;
+                state.cursors.clear();
+                state.last_word_selection = None;
             } else if state.modified {
-                app.show_message("Unsaved changes! ^S to save, ^X to discard");
+                // 변경사항이 있을 때
+                if state.pending_exit {
+                    // 두 번째 Esc: 변경 무시하고 종료
+                    if let Some(Screen::FileViewer) = app.previous_screen {
+                        if let Some(ref mut viewer) = app.viewer_state {
+                            viewer.scroll = state.scroll;
+                        }
+                        app.previous_screen = None;
+                        app.current_screen = Screen::FileViewer;
+                    } else {
+                        app.current_screen = Screen::DualPanel;
+                    }
+                } else {
+                    // 첫 번째 Esc: 경고 메시지
+                    state.pending_exit = true;
+                    app.show_message("Unsaved changes! Press Esc again to discard, ^S to save");
+                }
             } else {
-                // Go back to previous screen (viewer) or dual panel
+                // 변경사항 없으면 바로 종료
                 if let Some(Screen::FileViewer) = app.previous_screen {
-                    // 에디터의 스크롤 위치를 뷰어에 전달
                     if let Some(ref mut viewer) = app.viewer_state {
-                        viewer.scroll = state.scroll;
+                        let scroll = state.scroll;
+                        let path = viewer.file_path.clone();
+                        let _ = viewer.load_file(&path);
+                        viewer.scroll = scroll;
                     }
                     app.previous_screen = None;
                     app.current_screen = Screen::FileViewer;
@@ -1716,10 +2898,12 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             state.move_to_line_end(extend_selection);
         }
         KeyCode::PageUp => {
-            state.move_cursor(-20, 0, extend_selection);
+            let page_size = state.visible_height.max(1) as i32;
+            state.move_cursor(-page_size, 0, extend_selection);
         }
         KeyCode::PageDown => {
-            state.move_cursor(20, 0, extend_selection);
+            let page_size = state.visible_height.max(1) as i32;
+            state.move_cursor(page_size, 0, extend_selection);
         }
         KeyCode::Backspace => {
             state.delete_backward();
@@ -1731,12 +2915,23 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             state.insert_newline();
         }
         KeyCode::Tab => {
-            state.insert_tab();
+            if modifiers.contains(KeyModifiers::SHIFT) {
+                // Shift+Tab: 내어쓰기
+                state.outdent();
+            } else {
+                state.insert_tab();
+            }
         }
         KeyCode::Char(c) => {
             if !modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT)
             {
-                state.insert_char(c);
+                // 방어적 처리: 일부 터미널에서 Shift+문자가 소문자로 올 수 있음
+                let ch = if modifiers.contains(KeyModifiers::SHIFT) && c.is_ascii_lowercase() {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                };
+                state.insert_char(ch);
             }
         }
         _ => {}

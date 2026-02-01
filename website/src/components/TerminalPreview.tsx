@@ -22,7 +22,7 @@ export default function TerminalPreview() {
         <div className="p-4 font-mono text-sm">
           {/* Header */}
           <div className="text-center text-accent-cyan mb-2 font-bold">
-            COKACDIR v0.2.0
+            COKACDIR v0.4.6
           </div>
 
           {/* Dual panel */}
@@ -66,18 +66,26 @@ export default function TerminalPreview() {
             </motion.div>
           </div>
 
-          {/* Function bar */}
+          {/* Status bar */}
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             transition={{ delay: 1.1 }}
-            className="flex justify-between mt-3 text-xs border-t border-zinc-700 pt-2"
+            className="flex justify-center gap-4 mt-3 text-xs border-t border-zinc-700 pt-2"
           >
-            {['1Help', '2', '3View', '4Edit', '5Copy', '6Move', '7Mkdir', '8Del', '9Ren', '10Quit'].map((item, i) => (
-              <span key={i} className={i === 0 || i === 2 || i === 4 || i === 5 ? 'text-accent-cyan' : 'text-zinc-600'}>
-                {item}
-              </span>
-            ))}
+            <span>
+              <span className="text-accent-cyan">3</span>
+              <span className="text-zinc-500">d </span>
+              <span className="text-accent-cyan">5</span>
+              <span className="text-zinc-500">f </span>
+              <span className="text-accent-cyan">1.2GB</span>
+            </span>
+            <span className="text-zinc-600">|</span>
+            <span>
+              <span className="text-accent-cyan">500MB</span>
+              <span className="text-zinc-500">/</span>
+              <span className="text-accent-cyan">1TB</span>
+            </span>
           </motion.div>
         </div>
       </div>

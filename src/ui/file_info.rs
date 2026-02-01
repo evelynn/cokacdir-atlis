@@ -7,6 +7,7 @@ use std::thread;
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::Rect,
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
@@ -163,13 +164,31 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
 
     let mut lines: Vec<Line> = Vec::new();
 
+    let label_style = Style::default().fg(theme.file_info.label);
+    let value_style = Style::default().fg(theme.file_info.value);
+    let name_style = Style::default().fg(theme.file_info.value_name);
+    let path_style = Style::default().fg(theme.file_info.value_path);
+    let type_style = Style::default().fg(theme.file_info.value_type);
+    let size_style = Style::default().fg(theme.file_info.value_size);
+    let perm_style = Style::default().fg(theme.file_info.value_permission);
+    let owner_style = Style::default().fg(theme.file_info.value_owner);
+    let date_style = Style::default().fg(theme.file_info.value_date);
+    let calc_style = Style::default().fg(theme.file_info.calculating_text);
+    let spinner_style = Style::default().fg(theme.file_info.calculating_spinner);
+
     if let Ok(meta) = metadata {
         let name = path.file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        lines.push(info_line("Name", &name, theme));
-        lines.push(info_line("Path", &path.display().to_string(), theme));
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:12}", "Name"), label_style),
+            Span::styled(name, name_style),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:12}", "Path"), label_style),
+            Span::styled(path.display().to_string(), path_style),
+        ]));
 
         let file_type = if meta.is_dir() {
             "Directory"
@@ -178,7 +197,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
         } else {
             "File"
         };
-        lines.push(info_line("Type", file_type, theme));
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:12}", "Type"), label_style),
+            Span::styled(file_type.to_string(), type_style),
+        ]));
 
         // For directories, show calculated total size or calculating status
         if meta.is_dir() {
@@ -187,50 +209,90 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
                     // Show spinner while calculating
                     let spinner = get_spinner_frame();
                     lines.push(Line::from(vec![
-                        Span::styled(format!("{:12}", "Total Size"), theme.dim_style()),
-                        Span::styled(format!("{} Calculating...", spinner), theme.info_style()),
+                        Span::styled(format!("{:12}", "Total Size"), label_style),
+                        Span::styled(format!("{}", spinner), spinner_style),
+                        Span::styled(" Calculating...", calc_style),
                     ]));
                 } else if let Some(ref result) = state.result {
                     // Show calculated results
-                    lines.push(info_line("Total Size", &format_size(result.total_size), theme));
-                    lines.push(info_line("Files", &result.file_count.to_string(), theme));
-                    lines.push(info_line("Folders", &result.dir_count.to_string(), theme));
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{:12}", "Total Size"), label_style),
+                        Span::styled(format_size(result.total_size), size_style),
+                    ]));
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{:12}", "Files"), label_style),
+                        Span::styled(result.file_count.to_string(), size_style),
+                    ]));
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{:12}", "Folders"), label_style),
+                        Span::styled(result.dir_count.to_string(), size_style),
+                    ]));
                 } else {
                     // Calculation not started or cancelled
-                    lines.push(info_line("Size", &format_size(meta.len()), theme));
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{:12}", "Size"), label_style),
+                        Span::styled(format_size(meta.len()), size_style),
+                    ]));
                 }
             } else {
-                lines.push(info_line("Size", &format_size(meta.len()), theme));
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{:12}", "Size"), label_style),
+                    Span::styled(format_size(meta.len()), size_style),
+                ]));
             }
         } else {
-            lines.push(info_line("Size", &format_size(meta.len()), theme));
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:12}", "Size"), label_style),
+                Span::styled(format_size(meta.len()), size_style),
+            ]));
         }
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
             lines.push(Line::from(Span::raw("")));
-            lines.push(info_line("Permissions", &format_permissions(meta.mode()), theme));
-            lines.push(info_line("Owner/Group", &format!("{}/{}", meta.uid(), meta.gid()), theme));
-            lines.push(info_line("Links", &meta.nlink().to_string(), theme));
-            lines.push(info_line("Inode", &meta.ino().to_string(), theme));
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:12}", "Permissions"), label_style),
+                Span::styled(format_permissions(meta.mode()), perm_style),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:12}", "Owner/Group"), label_style),
+                Span::styled(format!("{}/{}", meta.uid(), meta.gid()), owner_style),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:12}", "Links"), label_style),
+                Span::styled(meta.nlink().to_string(), value_style),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:12}", "Inode"), label_style),
+                Span::styled(meta.ino().to_string(), value_style),
+            ]));
         }
 
         lines.push(Line::from(Span::raw("")));
 
         if let Ok(created) = meta.created() {
             let datetime: chrono::DateTime<chrono::Local> = created.into();
-            lines.push(info_line("Created", &datetime.format("%Y-%m-%d %H:%M:%S").to_string(), theme));
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:12}", "Created"), label_style),
+                Span::styled(datetime.format("%Y-%m-%d %H:%M:%S").to_string(), date_style),
+            ]));
         }
 
         if let Ok(modified) = meta.modified() {
             let datetime: chrono::DateTime<chrono::Local> = modified.into();
-            lines.push(info_line("Modified", &datetime.format("%Y-%m-%d %H:%M:%S").to_string(), theme));
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:12}", "Modified"), label_style),
+                Span::styled(datetime.format("%Y-%m-%d %H:%M:%S").to_string(), date_style),
+            ]));
         }
 
         if let Ok(accessed) = meta.accessed() {
             let datetime: chrono::DateTime<chrono::Local> = accessed.into();
-            lines.push(info_line("Accessed", &datetime.format("%Y-%m-%d %H:%M:%S").to_string(), theme));
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:12}", "Accessed"), label_style),
+                Span::styled(datetime.format("%Y-%m-%d %H:%M:%S").to_string(), date_style),
+            ]));
         }
 
         // Directory-specific info: show immediate item count
@@ -238,13 +300,16 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
             if let Ok(entries) = fs::read_dir(path) {
                 let count = entries.count();
                 lines.push(Line::from(Span::raw("")));
-                lines.push(info_line("Direct Items", &count.to_string(), theme));
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{:12}", "Direct Items"), label_style),
+                    Span::styled(count.to_string(), size_style),
+                ]));
             }
         }
     } else {
         lines.push(Line::from(Span::styled(
             "Error reading file information",
-            theme.error_style(),
+            Style::default().fg(theme.file_info.error_text),
         )));
     }
 
@@ -256,15 +321,16 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
         .map(|s| s.is_calculating)
         .unwrap_or(false);
 
+    let hint_style = Style::default().fg(theme.file_info.hint_text);
     if is_calculating {
         lines.push(Line::from(Span::styled(
             "Press ESC to cancel, any other key to close",
-            theme.dim_style(),
+            hint_style,
         )));
     } else {
         lines.push(Line::from(Span::styled(
             "Press any key to close",
-            theme.dim_style(),
+            hint_style,
         )));
     }
 
@@ -287,9 +353,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
 
     let block = Block::default()
         .title(" File Information ")
-        .title_style(theme.header_style())
+        .title_style(Style::default().fg(theme.file_info.title).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
-        .border_style(theme.border_style(true));
+        .border_style(Style::default().fg(theme.file_info.border))
+        .style(Style::default().bg(theme.file_info.bg));
 
     let inner = block.inner(dialog_area);
     frame.render_widget(block, dialog_area);
@@ -304,13 +371,6 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
 
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, padded_inner);
-}
-
-fn info_line<'a>(label: &str, value: &str, theme: &Theme) -> Line<'a> {
-    Line::from(vec![
-        Span::styled(format!("{:12}", label), theme.dim_style()),
-        Span::styled(value.to_string(), theme.normal_style()),
-    ])
 }
 
 pub fn handle_input(app: &mut App, code: KeyCode) {

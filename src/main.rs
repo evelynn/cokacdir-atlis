@@ -1,9 +1,9 @@
 mod ui;
 mod services;
 mod utils;
+mod config;
 
 use std::io;
-use std::path::PathBuf;
 use std::env;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
@@ -157,13 +157,23 @@ fn main() -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    // Create app state
-    let left_path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    let right_path = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-    let mut app = App::new(left_path, right_path);
+    // Load settings and create app state
+    let (settings, settings_error) = match config::Settings::load_with_error() {
+        Ok(s) => (s, None),
+        Err(e) => (config::Settings::default(), Some(e)),
+    };
+    let mut app = App::with_settings(settings);
+
+    // Show settings load error if any
+    if let Some(err) = settings_error {
+        app.show_message(&format!("Settings error: {} (using defaults)", err));
+    }
 
     // Run app
     let result = run_app(&mut terminal, &mut app);
+
+    // Save settings before exit
+    app.save_settings();
 
     // Restore terminal
     disable_raw_mode()?;
@@ -233,20 +243,45 @@ fn run_app<B: ratatui::backend::Backend>(
             if !still_active {
                 // Operation completed - extract result info before releasing borrow
                 let msg = if let Some(ref result) = progress.result {
-                    let op_name = match progress.operation_type {
-                        crate::services::file_ops::FileOperationType::Copy => "Copied",
-                        crate::services::file_ops::FileOperationType::Move => "Moved",
-                    };
-                    let total = result.success_count + result.failure_count;
-                    if result.failure_count == 0 {
-                        Some(format!("{} {} file(s)", op_name, result.success_count))
+                    // Special handling for Tar - show archive name
+                    if progress.operation_type == crate::services::file_ops::FileOperationType::Tar {
+                        if result.failure_count == 0 {
+                            if let Some(ref archive_name) = app.pending_tar_archive {
+                                Some(format!("Created: {}", archive_name))
+                            } else {
+                                Some(format!("Archived {} file(s)", result.success_count))
+                            }
+                        } else {
+                            Some(format!("Error: {}", result.last_error.as_deref().unwrap_or("Archive failed")))
+                        }
+                    } else if progress.operation_type == crate::services::file_ops::FileOperationType::Untar {
+                        if result.failure_count == 0 {
+                            if let Some(ref extract_dir) = app.pending_extract_dir {
+                                Some(format!("Extracted to: {}", extract_dir))
+                            } else {
+                                Some(format!("Extracted {} file(s)", result.success_count))
+                            }
+                        } else {
+                            Some(format!("Error: {}", result.last_error.as_deref().unwrap_or("Extract failed")))
+                        }
                     } else {
-                        Some(format!("{} {}/{}. Error: {}",
-                            op_name,
-                            result.success_count,
-                            total,
-                            result.last_error.as_deref().unwrap_or("Unknown error")
-                        ))
+                        let op_name = match progress.operation_type {
+                            crate::services::file_ops::FileOperationType::Copy => "Copied",
+                            crate::services::file_ops::FileOperationType::Move => "Moved",
+                            crate::services::file_ops::FileOperationType::Tar => "Archived",
+                            crate::services::file_ops::FileOperationType::Untar => "Extracted",
+                        };
+                        let total = result.success_count + result.failure_count;
+                        if result.failure_count == 0 {
+                            Some(format!("{} {} file(s)", op_name, result.success_count))
+                        } else {
+                            Some(format!("{} {}/{}. Error: {}",
+                                op_name,
+                                result.success_count,
+                                total,
+                                result.last_error.as_deref().unwrap_or("Unknown error")
+                            ))
+                        }
                     }
                 } else {
                     None
@@ -264,9 +299,23 @@ fn run_app<B: ratatui::backend::Backend>(
             if let Some(msg) = progress_message {
                 app.show_message(&msg);
             }
+            // Focus on created tar archive if applicable
+            if let Some(archive_name) = app.pending_tar_archive.take() {
+                app.refresh_panels();
+                if let Some(idx) = app.active_panel().files.iter().position(|f| f.name == archive_name) {
+                    app.active_panel_mut().selected_index = idx;
+                }
+            // Focus on extracted directory if applicable
+            } else if let Some(extract_dir) = app.pending_extract_dir.take() {
+                app.refresh_panels();
+                if let Some(idx) = app.active_panel().files.iter().position(|f| f.name == extract_dir) {
+                    app.active_panel_mut().selected_index = idx;
+                }
+            } else {
+                app.refresh_panels();
+            }
             app.file_operation_progress = None;
             app.dialog = None;
-            app.refresh_panels();
         }
 
         // Check for key events with timeout
@@ -291,16 +340,19 @@ fn run_app<B: ratatui::backend::Backend>(
                         ui::process_manager::handle_input(app, key.code);
                     }
                     Screen::Help => {
-                        // Any key closes help
-                        app.current_screen = Screen::DualPanel;
+                        if ui::help::handle_input(app, key.code) {
+                            app.current_screen = Screen::DualPanel;
+                        }
                     }
                     Screen::AIScreen => {
                         if let Some(ref mut state) = app.ai_state {
                             if ui::ai_screen::handle_input(state, key.code, key.modifiers) {
-                                // Save session before leaving
-                                app.save_ai_session();
+                                // Save session to file before leaving
+                                state.save_session_to_file();
                                 app.current_screen = Screen::DualPanel;
                                 app.ai_state = None;
+                                // Refresh panels in case AI modified files
+                                app.refresh_panels();
                             }
                         }
                     }
@@ -347,6 +399,7 @@ fn handle_dual_panel_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers
     if app.dialog.is_some() {
         return ui::dialogs::handle_dialog_input(app, code, modifiers);
     }
+
 
     // Handle Ctrl key combinations first
     if modifiers.contains(KeyModifiers::CONTROL) {
@@ -403,36 +456,33 @@ fn handle_dual_panel_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers
         // * - select/deselect all
         KeyCode::Char('*') => app.toggle_all_selection(),
 
+        // ; - select files by extension
+        KeyCode::Char(';') => app.select_by_extension(),
+
         // Sort keys
         KeyCode::Char('n') | KeyCode::Char('N') => app.toggle_sort_by_name(),
+        KeyCode::Char('y') | KeyCode::Char('Y') => app.toggle_sort_by_type(),
         KeyCode::Char('s') | KeyCode::Char('S') => app.toggle_sort_by_size(),
         KeyCode::Char('d') | KeyCode::Char('D') => app.toggle_sort_by_date(),
 
         // Function keys (alphabet)
         KeyCode::Char('h') | KeyCode::Char('H') => app.show_help(),
-        KeyCode::Char('o') | KeyCode::Char('O') => app.show_file_info(),
-        KeyCode::Char('v') | KeyCode::Char('V') => app.view_file(),
+        KeyCode::Char('i') | KeyCode::Char('I') => app.show_file_info(),
         KeyCode::Char('e') | KeyCode::Char('E') => app.edit_file(),
-        KeyCode::Char('c') | KeyCode::Char('C') => app.show_copy_dialog(),
-        KeyCode::Char('m') | KeyCode::Char('M') => app.show_move_dialog(),
         KeyCode::Char('k') | KeyCode::Char('K') => app.show_mkdir_dialog(),
         KeyCode::Char('x') | KeyCode::Char('X') | KeyCode::Delete | KeyCode::Backspace => app.show_delete_dialog(),
         KeyCode::Char('p') | KeyCode::Char('P') => app.show_process_manager(),
         KeyCode::Char('r') | KeyCode::Char('R') => app.show_rename_dialog(),
+        KeyCode::Char('t') | KeyCode::Char('T') => app.show_tar_dialog(),
         KeyCode::Char('f') => app.show_search_dialog(),
         KeyCode::Char('/') => app.show_goto_dialog(),
-        KeyCode::Char('~') => {
-            // 홈 폴더로 바로 이동
-            if let Some(home) = dirs::home_dir() {
-                app.execute_goto(&home.display().to_string());
-            }
-        }
+        KeyCode::Char('1') => app.goto_home(),
 
         // AI screen - '.'
         KeyCode::Char('.') => app.show_ai_screen(),
 
-        // System info - 'i' or 'I'
-        KeyCode::Char('i') | KeyCode::Char('I') => app.show_system_info(),
+        // Settings dialog - '`'
+        KeyCode::Char('`') => app.show_settings_dialog(),
 
         _ => {}
     }

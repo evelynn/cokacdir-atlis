@@ -10,8 +10,11 @@ Dual-panel terminal file manager with AI-powered natural language commands.
 - **AI-Powered Commands**: Natural language file operations powered by Claude AI. Press `.` and describe what you want.
 - **Dual-Panel Navigation**: Classic dual-panel interface for efficient file management
 - **Keyboard Driven**: Full keyboard navigation designed for power users
-- **Built-in Viewer & Editor**: View and edit files directly without leaving the application
+- **Built-in Viewer & Editor**: View and edit files with syntax highlighting for 20+ languages
+- **Image Viewer**: View images directly in terminal with zoom and pan support
 - **Process Manager**: Monitor and manage system processes. Sort by CPU, memory, or PID.
+- **File Search**: Find files by name pattern with recursive search
+- **Customizable Themes**: Light/Dark themes with full color customization
 
 ## Installation
 
@@ -81,19 +84,21 @@ Learn more at [docs.anthropic.com](https://docs.anthropic.com/en/docs/claude-cod
 | `Enter` | Open directory |
 | `Esc` | Parent directory |
 | `Tab` | Switch panels |
+| `←`/`→` | Switch panels (keep position) |
 | `Home`/`End` | First / Last item |
 | `PgUp`/`PgDn` | Move 10 lines |
 | `/` | Go to path |
+| `1` | Go to home directory |
 
 ### File Operations
 
 | Key | Action |
 |-----|--------|
-| `c` | Copy |
-| `m` | Move |
 | `k` | Create directory |
 | `x` | Delete |
 | `r` | Rename |
+| `t` | Create tar archive |
+| `f` | Find/Search files |
 
 ### Clipboard Operations
 
@@ -108,10 +113,10 @@ Learn more at [docs.anthropic.com](https://docs.anthropic.com/en/docs/claude-cod
 | Key | Action |
 |-----|--------|
 | `h` | Help |
-| `o` | File info |
-| `v` | View file |
+| `i` | File info |
 | `e` | Edit file |
 | `p` | Process manager |
+| `` ` `` | Settings |
 
 ### Selection & AI
 
@@ -119,7 +124,8 @@ Learn more at [docs.anthropic.com](https://docs.anthropic.com/en/docs/claude-cod
 |-----|--------|
 | `Space` | Select file |
 | `*` | Select all |
-| `n` / `s` / `d` | Sort by name / size / date |
+| `;` | Select by extension |
+| `n` / `s` / `d` / `y` | Sort by name / size / date / type |
 | `.` | AI command |
 | `q` | Quit |
 
@@ -127,36 +133,61 @@ Learn more at [docs.anthropic.com](https://docs.anthropic.com/en/docs/claude-cod
 
 | Key | Action |
 |-----|--------|
-| `q` | Close viewer |
-| `/` | Search |
-| `n` | Next match |
-| `N` | Previous match |
 | `↑`/`↓`/`j`/`k` | Scroll |
 | `PgUp`/`PgDn` | Page scroll |
-| `g`/`G` | Go to start/end |
+| `Home`/`End`/`G` | Go to start/end |
+| `Ctrl+F`/`/` | Search |
+| `Ctrl+G` | Go to line |
+| `b` | Toggle bookmark |
+| `[`/`]` | Prev/Next bookmark |
+| `H` | Toggle hex mode |
+| `W` | Toggle word wrap |
+| `E` | Open in editor |
+| `Esc`/`Q` | Close viewer |
 
 ### File Editor
 
 | Key | Action |
 |-----|--------|
 | `Ctrl+S` | Save |
-| `Ctrl+Q` | Quit (warns if unsaved) |
-| `Ctrl+X` | Discard changes and quit |
-| `Arrows` | Navigate |
-| `Tab` | Insert spaces |
+| `Ctrl+Z/Y` | Undo/Redo |
+| `Ctrl+C/X/V` | Copy/Cut/Paste |
+| `Ctrl+A` | Select all |
+| `Ctrl+D` | Select word |
+| `Ctrl+L` | Select line |
+| `Ctrl+K` | Delete line |
+| `Ctrl+J` | Duplicate line |
+| `Ctrl+/` | Toggle comment |
+| `Ctrl+F` | Find |
+| `Ctrl+H` | Find & Replace |
+| `Ctrl+G` | Go to line |
+| `Alt+↑/↓` | Move line up/down |
+| `Esc` | Close editor |
 
 ### Process Manager
 
 | Key | Action |
 |-----|--------|
+| `↑`/`↓` | Navigate processes |
+| `PgUp`/`PgDn` | Page scroll |
 | `k` | Kill process (SIGTERM) |
-| `9` | Force kill (SIGKILL) |
+| `K` | Force kill (SIGKILL) |
 | `r` | Refresh list |
 | `p` | Sort by PID |
 | `c` | Sort by CPU |
 | `m` | Sort by memory |
 | `n` | Sort by command name |
-| `Esc` | Close |
+| `Esc`/`q` | Close |
+
+### Image Viewer
+
+| Key | Action |
+|-----|--------|
+| `+`/`-` | Zoom in/out |
+| `r` | Reset zoom |
+| `↑`/`↓`/`←`/`→` | Pan image |
+| `PgUp`/`PgDn` | Previous/Next image |
+| `Esc`/`q` | Close viewer |
 
 ## Supported Platforms
 

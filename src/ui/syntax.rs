@@ -130,43 +130,28 @@ pub struct SyntaxColors {
 
 impl Default for SyntaxColors {
     fn default() -> Self {
-        // Dracula-like syntax colors
         Self {
-            keyword: Color::Rgb(255, 121, 198),     // Pink
-            type_color: Color::Rgb(139, 233, 253), // Cyan
-            string: Color::Rgb(241, 250, 140),     // Yellow
-            number: Color::Rgb(189, 147, 249),     // Purple
-            comment: Color::Rgb(98, 114, 164),     // Comment gray
-            operator: Color::Rgb(255, 121, 198),   // Pink
-            function: Color::Rgb(80, 250, 123),    // Green
-            macro_color: Color::Rgb(139, 233, 253),// Cyan
-            attribute: Color::Rgb(80, 250, 123),   // Green
-            variable: Color::Rgb(248, 248, 242),   // Foreground
-            constant: Color::Rgb(189, 147, 249),   // Purple
-            bracket: Color::Rgb(248, 248, 242),    // Foreground
-            normal: Color::Rgb(248, 248, 242),     // Foreground
+            keyword: Color::Indexed(239),
+            type_color: Color::Indexed(240),
+            string: Color::Indexed(242),
+            number: Color::Indexed(243),
+            comment: Color::Indexed(244),
+            operator: Color::Indexed(241),
+            function: Color::Indexed(240),
+            macro_color: Color::Indexed(239),
+            attribute: Color::Indexed(241),
+            variable: Color::Indexed(245),
+            constant: Color::Indexed(243),
+            bracket: Color::Indexed(245),
+            normal: Color::Indexed(245),
         }
     }
 }
 
 impl SyntaxColors {
-    /// 256 색상 호환 버전
+    /// 256 색상 호환 버전 (default와 동일)
     pub fn compatible() -> Self {
-        Self {
-            keyword: Color::Magenta,
-            type_color: Color::Cyan,
-            string: Color::Yellow,
-            number: Color::LightMagenta,
-            comment: Color::DarkGray,
-            operator: Color::Magenta,
-            function: Color::Green,
-            macro_color: Color::Cyan,
-            attribute: Color::Green,
-            variable: Color::White,
-            constant: Color::LightMagenta,
-            bracket: Color::White,
-            normal: Color::White,
-        }
+        Self::default()
     }
 
     /// 토큰 타입에 따른 스타일 반환
