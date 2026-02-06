@@ -537,7 +537,6 @@ fn run_app<B: ratatui::backend::Backend>(
                     }
                 }
                 Event::Paste(text) => {
-                    // Handle paste event for AI input
                     match app.current_screen {
                         Screen::AIScreen => {
                             if let Some(ref mut state) = app.ai_state {
@@ -550,6 +549,18 @@ fn run_app<B: ratatui::backend::Backend>(
                                 if let Some(ref mut state) = app.ai_state {
                                     ui::ai_screen::handle_paste(state, &text);
                                 }
+                            } else if app.dialog.is_some() {
+                                ui::dialogs::handle_paste(app, &text);
+                            } else if app.advanced_search_state.active {
+                                ui::advanced_search::handle_paste(&mut app.advanced_search_state, &text);
+                            }
+                        }
+                        Screen::FileEditor => {
+                            ui::file_editor::handle_paste(app, &text);
+                        }
+                        Screen::ImageViewer => {
+                            if app.dialog.is_some() {
+                                ui::dialogs::handle_paste(app, &text);
                             }
                         }
                         _ => {}

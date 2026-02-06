@@ -204,6 +204,15 @@ pub fn draw(frame: &mut Frame, state: &AdvancedSearchState, area: Rect, theme: &
     );
 }
 
+/// Handle paste event for advanced search
+pub fn handle_paste(state: &mut AdvancedSearchState, text: &str) {
+    // Use only the first line for single-line search fields
+    let paste_text = text.lines().next().unwrap_or("").replace('\r', "");
+    if !paste_text.is_empty() {
+        state.values[state.active_field].push_str(&paste_text);
+    }
+}
+
 pub fn handle_input(state: &mut AdvancedSearchState, code: KeyCode) -> Option<SearchCriteria> {
     match code {
         KeyCode::Esc => {

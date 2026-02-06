@@ -2682,6 +2682,19 @@ fn render_editor_line(
     spans
 }
 
+/// Handle paste event for file editor
+pub fn handle_paste(app: &mut App, text: &str) {
+    let state = match &mut app.editor_state {
+        Some(s) => s,
+        None => return,
+    };
+    if !text.is_empty() {
+        // Normalize line endings
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        state.insert_str(&normalized);
+    }
+}
+
 pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     let state = match &mut app.editor_state {
         Some(s) => s,

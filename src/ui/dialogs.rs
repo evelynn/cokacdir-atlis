@@ -2103,6 +2103,60 @@ fn draw_completion_list(
     }
 }
 
+/// Handle paste event for dialogs with text input
+pub fn handle_paste(app: &mut App, text: &str) {
+    // Use only the first line for single-line dialog inputs
+    let paste_text = text.lines().next().unwrap_or("").replace('\r', "");
+    if paste_text.is_empty() {
+        return;
+    }
+
+    if let Some(ref mut dialog) = app.dialog {
+        match dialog.dialog_type {
+            // Dialog types with text input
+            DialogType::Search | DialogType::Mkdir | DialogType::Mkfile
+            | DialogType::Rename | DialogType::Tar | DialogType::BinaryFileHandler => {
+                // Delete selection if exists
+                if let Some((sel_start, sel_end)) = dialog.selection.take() {
+                    let mut chars: Vec<char> = dialog.input.chars().collect();
+                    chars.drain(sel_start..sel_end);
+                    dialog.input = chars.into_iter().collect();
+                    dialog.cursor_pos = sel_start;
+                }
+                // Insert pasted text at cursor
+                let mut chars: Vec<char> = dialog.input.chars().collect();
+                let paste_chars: Vec<char> = paste_text.chars().collect();
+                let paste_len = paste_chars.len();
+                for (i, c) in paste_chars.into_iter().enumerate() {
+                    chars.insert(dialog.cursor_pos + i, c);
+                }
+                dialog.input = chars.into_iter().collect();
+                dialog.cursor_pos += paste_len;
+            }
+            DialogType::Goto | DialogType::Copy | DialogType::Move => {
+                // Delete selection if exists
+                if let Some((sel_start, sel_end)) = dialog.selection.take() {
+                    let mut chars: Vec<char> = dialog.input.chars().collect();
+                    chars.drain(sel_start..sel_end);
+                    dialog.input = chars.into_iter().collect();
+                    dialog.cursor_pos = sel_start;
+                }
+                // Insert pasted text at cursor
+                let mut chars: Vec<char> = dialog.input.chars().collect();
+                let paste_chars: Vec<char> = paste_text.chars().collect();
+                let paste_len = paste_chars.len();
+                for (i, c) in paste_chars.into_iter().enumerate() {
+                    chars.insert(dialog.cursor_pos + i, c);
+                }
+                dialog.input = chars.into_iter().collect();
+                dialog.cursor_pos += paste_len;
+                update_path_suggestions(dialog);
+            }
+            _ => {}
+        }
+    }
+}
+
 pub fn handle_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
     if let Some(ref mut dialog) = app.dialog {
         match dialog.dialog_type {
