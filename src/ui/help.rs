@@ -31,9 +31,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
     let lines = build_help_content(theme, &app.keybindings);
     let total_lines = lines.len();
 
-    // Calculate dialog size (max 80% of screen, within bounds)
-    let width = ((area.width as u32 * 80 / 100) as u16).min(70).max(50);
-    let height = ((area.height as u32 * 80 / 100) as u16).min(45).max(20);
+    // Calculate dialog size (max 85% of screen, within bounds)
+    let width = ((area.width as u32 * 85 / 100) as u16).min(100).max(50);
+    let height = ((area.height as u32 * 85 / 100) as u16).min(50).max(20);
 
     // Need minimum size to display anything useful
     if width < 30 || height < 10 {
@@ -144,6 +144,9 @@ pub fn handle_input(app: &mut App, code: KeyCode) -> bool {
 
 /// Build the help content as styled lines
 fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
+    // Content width is passed implicitly; we use a fixed wrap width for quick reference
+    // that matches the expanded dialog (100 max - 2 borders = 98, minus some padding)
+    let qr_wrap_width: usize = 96;
     let section_title_style = Style::default()
         .fg(theme.help.section_title)
         .add_modifier(Modifier::BOLD);
@@ -167,16 +170,16 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     // Helper to create key-description line (static strings)
     let key_line = |key: &str, desc: &str| -> Line<'static> {
         Line::from(vec![
-            Span::styled(format!("  {:16}", key), key_style),
+            Span::styled(format!("  {:28}", key), key_style),
             Span::styled(desc.to_string(), desc_style),
         ])
     };
 
     // Helper to create key-description line from a PanelAction (reads from keybindings)
     let pk = |action: PanelAction, desc: &str| -> Line<'static> {
-        let key_display = kb.panel_keys_joined(action, " / ");
+        let key_display = kb.panel_first_key(action).to_string();
         Line::from(vec![
-            Span::styled(format!("  {:16}", key_display), key_style),
+            Span::styled(format!("  {:28}", key_display), key_style),
             Span::styled(desc.to_string(), desc_style),
         ])
     };
@@ -272,9 +275,9 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     // ═══════════════════════════════════════════════════════════════════════
     // Helper to create key-description line from an EditorAction
     let ek = |action: EditorAction, desc: &str| -> Line<'static> {
-        let key_display = kb.editor_keys_joined(action, " / ");
+        let key_display = kb.editor_first_key(action).to_string();
         Line::from(vec![
-            Span::styled(format!("  {:16}", key_display), key_style),
+            Span::styled(format!("  {:28}", key_display), key_style),
             Span::styled(desc.to_string(), desc_style),
         ])
     };
@@ -310,9 +313,9 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     // ═══════════════════════════════════════════════════════════════════════
     // Helper to create key-description line from an ImageViewerAction
     let ivk = |action: ImageViewerAction, desc: &str| -> Line<'static> {
-        let key_display = kb.image_viewer_keys_joined(action, " / ");
+        let key_display = kb.image_viewer_first_key(action).to_string();
         Line::from(vec![
-            Span::styled(format!("  {:16}", key_display), key_style),
+            Span::styled(format!("  {:28}", key_display), key_style),
             Span::styled(desc.to_string(), desc_style),
         ])
     };
@@ -333,9 +336,9 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     // ═══════════════════════════════════════════════════════════════════════
     // Helper to create key-description line from a ProcessManagerAction
     let pmk = |action: ProcessManagerAction, desc: &str| -> Line<'static> {
-        let key_display = kb.process_manager_keys_joined(action, " / ");
+        let key_display = kb.process_manager_first_key(action).to_string();
         Line::from(vec![
-            Span::styled(format!("  {:16}", key_display), key_style),
+            Span::styled(format!("  {:28}", key_display), key_style),
             Span::styled(desc.to_string(), desc_style),
         ])
     };
@@ -360,9 +363,9 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     // ═══════════════════════════════════════════════════════════════════════
     lines.push(section("AI Assistant"));
     let aik = |action: AIScreenAction, desc: &str| -> Line<'static> {
-        let key_display = kb.ai_screen_keys_joined(action, " / ");
+        let key_display = kb.ai_screen_first_key(action).to_string();
         Line::from(vec![
-            Span::styled(format!("  {:16}", key_display), key_style),
+            Span::styled(format!("  {:28}", key_display), key_style),
             Span::styled(desc.to_string(), desc_style),
         ])
     };
@@ -382,9 +385,9 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     // ═══════════════════════════════════════════════════════════════════════
     // Helper to create key-description line from a SearchResultAction
     let srk = |action: SearchResultAction, desc: &str| -> Line<'static> {
-        let key_display = kb.search_result_keys_joined(action, " / ");
+        let key_display = kb.search_result_first_key(action).to_string();
         Line::from(vec![
-            Span::styled(format!("  {:16}", key_display), key_style),
+            Span::styled(format!("  {:28}", key_display), key_style),
             Span::styled(desc.to_string(), desc_style),
         ])
     };
@@ -402,9 +405,9 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     // ═══════════════════════════════════════════════════════════════════════
     // Helper to create key-description line from a DiffScreenAction
     let dsk = |action: DiffScreenAction, desc: &str| -> Line<'static> {
-        let key_display = kb.diff_screen_keys_joined(action, " / ");
+        let key_display = kb.diff_screen_first_key(action).to_string();
         Line::from(vec![
-            Span::styled(format!("  {:16}", key_display), key_style),
+            Span::styled(format!("  {:28}", key_display), key_style),
             Span::styled(desc.to_string(), desc_style),
         ])
     };
@@ -440,9 +443,9 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     // ═══════════════════════════════════════════════════════════════════════
     // Helper to create key-description line from a DiffFileViewAction
     let dfk = |action: DiffFileViewAction, desc: &str| -> Line<'static> {
-        let key_display = kb.diff_file_view_keys_joined(action, " / ");
+        let key_display = kb.diff_file_view_first_key(action).to_string();
         Line::from(vec![
-            Span::styled(format!("  {:16}", key_display), key_style),
+            Span::styled(format!("  {:28}", key_display), key_style),
             Span::styled(desc.to_string(), desc_style),
         ])
     };
@@ -515,7 +518,7 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
         for (action, label) in &qr_items {
             let key_str = kb.panel_first_key(*action).to_string();
             let entry_width = key_str.len() + 1 + label.len(); // key:label
-            if row_width + entry_width > 70 && row_width > 2 {
+            if row_width + entry_width > qr_wrap_width && row_width > 2 {
                 lines.push(Line::from(std::mem::take(&mut row_spans)));
                 row_spans.push(Span::styled("  ".to_string(), desc_style));
                 row_width = 2;
@@ -535,24 +538,28 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     // ═══════════════════════════════════════════════════════════════════════
     lines.push(section("Developer"));
     lines.push(Line::from(vec![
-        Span::styled("  Developer        ", key_style),
-        Span::styled("cokac (코드깎는노인)", desc_style),
+        Span::styled(format!("  {:28}", "Developer"), key_style),
+        Span::styled("cokac (코드깎는노인)".to_string(), desc_style),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("  Email            ", key_style),
-        Span::styled("monogatree@gmail.com", desc_style),
+        Span::styled(format!("  {:28}", "Email"), key_style),
+        Span::styled("monogatree@gmail.com".to_string(), desc_style),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("  Website          ", key_style),
-        Span::styled("https://cokacdir.cokac.com", desc_style),
+        Span::styled(format!("  {:28}", "Website"), key_style),
+        Span::styled("https://cokacdir.cokac.com".to_string(), desc_style),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("  YouTube          ", key_style),
-        Span::styled("https://www.youtube.com/@코드깎는노인", desc_style),
+        Span::styled(format!("  {:28}", "YouTube"), key_style),
+        Span::styled("https://www.youtube.com/@코드깎는노인".to_string(), desc_style),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("  코깎노클래스     ", key_style),
-        Span::styled("https://cokac.com/", desc_style),
+        Span::styled(format!("  {:28}", "코깎노클래스"), key_style),
+        Span::styled("https://cokac.com/".to_string(), desc_style),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(format!("  {:28}", "Tutorial"), key_style),
+        Span::styled("https://cokacdir.cokac.com/#/tutorial".to_string(), desc_style),
     ]));
     lines.push(Line::from(""));
 
