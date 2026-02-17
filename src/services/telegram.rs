@@ -8,7 +8,6 @@ use tokio::sync::Mutex;
 use teloxide::prelude::*;
 use teloxide::types::ParseMode;
 
-use crate::config::Settings;
 use crate::services::claude::{self, StreamMessage};
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
 
@@ -24,40 +23,12 @@ type SharedState = Arc<Mutex<HashMap<ChatId, ChatSession>>>;
 /// Telegram message length limit
 const TELEGRAM_MSG_LIMIT: usize = 4096;
 
-const GREETING_MESSAGE: &str = "\
-<b>cokacdir Bot Server Started.</b>
-
-<b>Available Commands:</b>
-<code>/start &lt;path&gt;</code> - Start AI session (e.g. <code>/start /home/kst</code>)
-<code>/clear</code> - Clear current session
-<code>/pwd</code> - Show current working path
-<code>/down &lt;filepath&gt;</code> - Download file (e.g. <code>/down report.txt</code>)
-<code>!&lt;command&gt;</code> - Run shell command (e.g. <code>!ls -la</code>)
-
-After starting a session, type any text to chat with AI.
-Send a file or photo to upload it to the current session path.
-
-<b>Usage Example:</b>
-1. <code>/start /home/kst/project</code> — Start session at project directory
-2. <code>What files are in this directory?</code> — Ask AI
-3. <code>!git status</code> — Run shell command directly
-4. <code>Summarize the README.md file</code> — Ask AI to analyze files
-5. <code>/clear</code> — Clear session and start fresh";
-
 /// Entry point: start the Telegram bot with long polling
-pub async fn run_bot(token: &str, chat_id: Option<i64>) {
+pub async fn run_bot(token: &str) {
     let bot = Bot::new(token);
     let state: SharedState = Arc::new(Mutex::new(HashMap::new()));
 
     println!("Telegram bot server started. Waiting for messages...");
-
-    // Send greeting message if chat_id is configured
-    if let Some(id) = chat_id {
-        let target = ChatId(id);
-        let _ = bot.send_message(target, GREETING_MESSAGE)
-            .parse_mode(ParseMode::Html)
-            .await;
-    }
 
     let shared_state = state.clone();
     teloxide::repl(bot, move |bot: Bot, msg: Message| {
@@ -76,9 +47,6 @@ async fn handle_message(
     state: SharedState,
 ) -> ResponseResult<()> {
     let chat_id = msg.chat.id;
-
-    // Auto-save chat_id to settings if not already saved
-    save_chat_id_if_needed(chat_id);
 
     // Handle file/photo uploads
     if msg.document().is_some() || msg.photo().is_some() {
@@ -461,8 +429,24 @@ async fn handle_text_message(
     // Sanitize input
     let sanitized_input = ai_screen::sanitize_user_input(user_text);
 
-    // Pass user input directly without system prompt
+    // Pass user input directly
     let context_prompt = sanitized_input;
+
+    // Build system prompt with sendfile instructions
+    let system_prompt_owned = format!(
+        "You are chatting with a user through Telegram.\n\
+         When your work produces a file the user would want (generated code, reports, images, archives, etc.),\n\
+         send it by running this bash command:\n\n\
+         cokacdir --sendfile <filepath> --chat {} --key {}\n\n\
+         This delivers the file directly to the user's Telegram chat.\n\
+         Do NOT tell the user to use /down — use the command above instead.\n\n\
+         Always keep the user informed about what you are doing. \
+         Briefly explain each step as you work (e.g. \"Reading the file...\", \"Creating the script...\", \"Running tests...\"). \
+         The user cannot see your tool calls, so narrate your progress so they know what is happening.\n\n\
+         NEVER use the AskUserQuestion tool. The user is on Telegram and cannot interact with it. \
+         If you need clarification, just ask in plain text.",
+        chat_id.0, bot.token()
+    );
 
     // Create channel for streaming
     let (tx, rx) = mpsc::channel();
@@ -477,7 +461,7 @@ async fn handle_text_message(
             session_id_clone.as_deref(),
             &current_path_clone,
             tx.clone(),
-            Some(""),
+            Some(&system_prompt_owned),
         );
 
         if let Err(e) = result {
@@ -505,14 +489,16 @@ async fn handle_text_message(
                         StreamMessage::Text { content } => {
                             full_response.push_str(&content);
                         }
-                        StreamMessage::ToolUse { name, .. } => {
-                            full_response.push_str(&format!("\n[Tool: {}]\n", name));
+                        StreamMessage::ToolUse { name, input } => {
+                            let summary = format_tool_input(&name, &input);
+                            full_response.push_str(&format!("\n\n🔧 {}\n", summary));
                         }
                         StreamMessage::ToolResult { content, is_error } => {
                             if is_error {
-                                full_response.push_str(&format!("\n[Error: {}]\n", truncate_str(&content, 500)));
+                                full_response.push_str(&format!("\n❌ {}\n\n", truncate_str(&content, 500)));
+                            } else if !content.is_empty() {
+                                full_response.push_str(&format!("\n✅ {}\n\n", truncate_str(&content, 300)));
                             }
-                            // Skip non-error tool results to keep response clean
                         }
                         StreamMessage::TaskNotification { summary, .. } => {
                             if !summary.is_empty() {
@@ -967,14 +953,67 @@ fn find_closing_single(chars: &[char], start: usize, marker: char) -> Option<usi
     None
 }
 
-/// Save chat_id to settings if not already stored
-fn save_chat_id_if_needed(chat_id: ChatId) {
-    let id = chat_id.0;
-    let settings = Settings::load();
-    if settings.telegram_chat_id == Some(id) {
-        return;
+/// Format tool input JSON into a human-readable summary
+fn format_tool_input(name: &str, input: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(input) else {
+        return format!("{} {}", name, truncate_str(input, 200));
+    };
+
+    match name {
+        "Bash" => {
+            let desc = v.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let cmd = v.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            if !desc.is_empty() {
+                format!("{}: {}", desc, truncate_str(cmd, 150))
+            } else {
+                truncate_str(cmd, 200)
+            }
+        }
+        "Read" => {
+            let fp = v.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+            format!("Read {}", fp)
+        }
+        "Write" => {
+            let fp = v.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+            format!("Write {}", fp)
+        }
+        "Edit" => {
+            let fp = v.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+            format!("Edit {}", fp)
+        }
+        "Glob" => {
+            let pattern = v.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let path = v.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if !path.is_empty() {
+                format!("Glob {} in {}", pattern, path)
+            } else {
+                format!("Glob {}", pattern)
+            }
+        }
+        "Grep" => {
+            let pattern = v.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let path = v.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if !path.is_empty() {
+                format!("Grep \"{}\" in {}", pattern, path)
+            } else {
+                format!("Grep \"{}\"", pattern)
+            }
+        }
+        "WebSearch" => {
+            let query = v.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            format!("Search: {}", query)
+        }
+        "WebFetch" => {
+            let url = v.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            format!("Fetch {}", url)
+        }
+        "Task" => {
+            let desc = v.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            format!("Task: {}", desc)
+        }
+        _ => {
+            format!("{} {}", name, truncate_str(input, 200))
+        }
     }
-    let mut settings = settings;
-    settings.telegram_chat_id = Some(id);
-    let _ = settings.save();
 }
+

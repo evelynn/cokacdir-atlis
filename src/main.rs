@@ -40,8 +40,9 @@ fn print_help() {
     println!("    --prompt <TEXT>         Send prompt to AI and print rendered response");
     println!("    --design                Enable theme hot-reload (for theme development)");
     println!("    --base64 <TEXT>         Decode base64 and print (internal use)");
-    println!("    --ccsetkey <TOKEN>      Save Telegram bot token to settings");
-    println!("    --ccserver              Start Telegram bot server");
+    println!("    --ccserver <TOKEN>...   Start Telegram bot server(s)");
+    println!("    --sendfile <PATH> --chat <ID> --key <TOKEN>");
+    println!("                            Send file via Telegram bot (internal use)");
     println!();
     println!("HOMEPAGE: https://cokacdir.cokac.com");
 }
@@ -62,39 +63,54 @@ fn handle_base64(encoded: &str) {
     }
 }
 
+fn handle_sendfile(path: &str, chat_id: i64, token: &str) {
+    use teloxide::prelude::*;
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+    rt.block_on(async {
+        let bot = Bot::new(token);
+        let file_path = std::path::Path::new(path);
+        if !file_path.exists() {
+            eprintln!("Error: file not found: {}", path);
+            std::process::exit(1);
+        }
+        match bot.send_document(
+            ChatId(chat_id),
+            teloxide::types::InputFile::file(file_path),
+        ).await {
+            Ok(_) => println!("File sent: {}", path),
+            Err(e) => {
+                eprintln!("Failed to send file: {}", e);
+                std::process::exit(1);
+            }
+        }
+    });
+}
+
 fn print_version() {
     println!("cokacdir {}", VERSION);
 }
 
-fn handle_ccsetkey(token: &str) {
-    config::Settings::ensure_config_exists();
-    let mut settings = config::Settings::load();
-    settings.telegram_bot_token = Some(token.to_string());
-    match settings.save() {
-        Ok(_) => println!("Telegram bot token saved successfully."),
-        Err(e) => eprintln!("Error saving token: {}", e),
-    }
-}
-
-fn handle_ccserver() {
-    config::Settings::ensure_config_exists();
-    let settings = config::Settings::load();
-    let Some(token) = settings.telegram_bot_token else {
-        eprintln!("Error: No Telegram bot token found.");
-        eprintln!("Set it first with: cokacdir --ccsetkey <TOKEN>");
-        return;
-    };
-
-    if token.trim().is_empty() {
-        eprintln!("Error: Telegram bot token is empty.");
-        eprintln!("Set it first with: cokacdir --ccsetkey <TOKEN>");
-        return;
-    }
-
-    println!("Starting Telegram bot server...");
-
+fn handle_ccserver(tokens: Vec<String>) {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-    rt.block_on(services::telegram::run_bot(&token, settings.telegram_chat_id));
+
+    if tokens.len() == 1 {
+        println!("Starting Telegram bot server...");
+        rt.block_on(services::telegram::run_bot(&tokens[0]));
+    } else {
+        println!("Starting {} Telegram bot servers...", tokens.len());
+        rt.block_on(async {
+            let mut handles = Vec::new();
+            for (i, token) in tokens.into_iter().enumerate() {
+                handles.push(tokio::spawn(async move {
+                    println!("Bot #{} started.", i + 1);
+                    services::telegram::run_bot(&token).await;
+                }));
+            }
+            for handle in handles {
+                let _ = handle.await;
+            }
+        });
+    }
 }
 
 fn handle_prompt(prompt: &str) {
@@ -202,17 +218,59 @@ fn main() -> io::Result<()> {
                 handle_base64(&args[i + 1]);
                 return Ok(());
             }
-            "--ccsetkey" => {
-                if i + 1 >= args.len() {
-                    eprintln!("Error: --ccsetkey requires a token argument");
-                    eprintln!("Usage: cokacdir --ccsetkey <TELEGRAM_BOT_TOKEN>");
+            "--ccserver" => {
+                let tokens: Vec<String> = args[i + 1..].iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .cloned()
+                    .collect();
+                if tokens.is_empty() {
+                    eprintln!("Error: --ccserver requires at least one token argument");
+                    eprintln!("Usage: cokacdir --ccserver <TOKEN> [TOKEN2] ...");
                     return Ok(());
                 }
-                handle_ccsetkey(&args[i + 1]);
+                handle_ccserver(tokens);
                 return Ok(());
             }
-            "--ccserver" => {
-                handle_ccserver();
+            "--sendfile" => {
+                // Parse: --sendfile <PATH> --chat <ID> --key <TOKEN>
+                let mut file_path: Option<String> = None;
+                let mut chat_id: Option<i64> = None;
+                let mut key: Option<String> = None;
+                let mut j = i + 1;
+                while j < args.len() {
+                    match args[j].as_str() {
+                        "--chat" => {
+                            if j + 1 < args.len() {
+                                chat_id = args[j + 1].parse().ok();
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
+                        }
+                        "--key" => {
+                            if j + 1 < args.len() {
+                                key = Some(args[j + 1].clone());
+                                j += 2;
+                            } else {
+                                j += 1;
+                            }
+                        }
+                        _ if file_path.is_none() && !args[j].starts_with("--") => {
+                            file_path = Some(args[j].clone());
+                            j += 1;
+                        }
+                        _ => { j += 1; }
+                    }
+                }
+                match (file_path, chat_id, key) {
+                    (Some(fp), Some(cid), Some(k)) => {
+                        handle_sendfile(&fp, cid, &k);
+                    }
+                    _ => {
+                        eprintln!("Error: --sendfile requires <PATH>, --chat <ID>, and --key <TOKEN>");
+                        eprintln!("Usage: cokacdir --sendfile <PATH> --chat <ID> --key <TOKEN>");
+                    }
+                }
                 return Ok(());
             }
             "--design" => {

@@ -10,11 +10,9 @@ cokacdir의 AI 기능(`.` 단축키)을 텔레그램 Bot을 통해 원격으로 
 
 ## CLI 명령어
 
-### `cokacdir --ccsetkey <TOKEN>`
-텔레그램 Bot 토큰을 `~/.cokacdir/settings.json`에 저장한다.
-
-### `cokacdir --ccserver`
-텔레그램 Bot 서버를 시작한다. 저장된 토큰을 사용하여 Long Polling 방식으로 동작한다.
+### `cokacdir --ccserver <TOKEN> [TOKEN2] ...`
+텔레그램 Bot 서버를 시작한다. 토큰을 인자로 직접 전달하며, Long Polling 방식으로 동작한다.
+여러 토큰을 전달하면 각각의 봇이 동시에 구동된다.
 
 ## 텔레그램 명령어
 

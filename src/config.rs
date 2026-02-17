@@ -97,12 +97,6 @@ pub struct Settings {
     /// Encryption split size in MB (0 = no split)
     #[serde(default = "default_encrypt_split_size")]
     pub encrypt_split_size: u64,
-    /// Telegram bot token for remote control
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub telegram_bot_token: Option<String>,
-    /// Telegram chat ID for sending startup greeting
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub telegram_chat_id: Option<i64>,
 }
 
 impl Default for Settings {
@@ -144,8 +138,6 @@ impl Default for Settings {
             remote_profiles: Vec::new(),
             keybindings: KeybindingsConfig::default(),
             encrypt_split_size: default_encrypt_split_size(),
-            telegram_bot_token: None,
-            telegram_chat_id: None,
         }
     }
 }

@@ -179,10 +179,8 @@ export default function TelegramBot() {
                 <strong className="text-zinc-300"> Terminal.app</strong> 또는 <strong className="text-zinc-300">iTerm2</strong>를 열고 아래 명령어를 실행하세요.
               </p>
               <div className="bg-bg-elevated border border-zinc-700 rounded p-3 text-sm font-mono">
-                <div className="text-zinc-500 mb-1"># 토큰 등록</div>
-                <div className="text-accent-cyan">cokacdir --ccsetkey YOUR_BOT_TOKEN</div>
-                <div className="text-zinc-500 mt-2 mb-1"># 서버 시작</div>
-                <div className="text-accent-cyan">cokacdir --ccserver</div>
+                <div className="text-zinc-500 mb-1"># 서버 시작</div>
+                <div className="text-accent-cyan">cokacdir --ccserver YOUR_BOT_TOKEN</div>
               </div>
               <p className="text-zinc-500 text-xs mt-2">
                 macOS의 경로 예시: <code className="font-mono">/Users/username/Documents</code>
@@ -201,10 +199,8 @@ export default function TelegramBot() {
                 터미널을 열고 아래 명령어를 실행하세요.
               </p>
               <div className="bg-bg-elevated border border-zinc-700 rounded p-3 text-sm font-mono">
-                <div className="text-zinc-500 mb-1"># 토큰 등록</div>
-                <div className="text-accent-cyan">cokacdir --ccsetkey YOUR_BOT_TOKEN</div>
-                <div className="text-zinc-500 mt-2 mb-1"># 서버 시작</div>
-                <div className="text-accent-cyan">cokacdir --ccserver</div>
+                <div className="text-zinc-500 mb-1"># 서버 시작</div>
+                <div className="text-accent-cyan">cokacdir --ccserver YOUR_BOT_TOKEN</div>
               </div>
               <p className="text-zinc-500 text-xs mt-2">
                 Linux의 경로 예시: <code className="font-mono">/home/username/projects</code>
@@ -253,8 +249,7 @@ export default function TelegramBot() {
                 </p>
                 <div className="font-mono">
                   <div className="text-zinc-500 mb-1"># WSL 터미널에서 실행</div>
-                  <div className="text-accent-cyan">cokacdir --ccsetkey YOUR_BOT_TOKEN</div>
-                  <div className="text-accent-cyan">cokacdir --ccserver</div>
+                  <div className="text-accent-cyan">cokacdir --ccserver YOUR_BOT_TOKEN</div>
                 </div>
               </div>
 
@@ -285,7 +280,7 @@ export default function TelegramBot() {
           <div className="bg-bg-card border border-zinc-800 rounded-lg p-4 mb-4">
             <div className="bg-bg-elevated border border-zinc-700 rounded p-3 text-sm font-mono mb-3">
               <div className="text-zinc-500 mb-1"># 백그라운드 실행 (macOS, Linux, WSL 공통)</div>
-              <div className="text-accent-cyan">nohup cokacdir --ccserver &amp;</div>
+              <div className="text-accent-cyan">nohup cokacdir --ccserver YOUR_BOT_TOKEN &amp;</div>
             </div>
             <div className="bg-bg-elevated border border-zinc-700 rounded p-3 text-sm font-mono mb-3">
               <div className="text-zinc-500 mb-1"># 실행 중인 Bot 서버 확인</div>
@@ -298,9 +293,8 @@ export default function TelegramBot() {
           </div>
 
           <TipBox>
-            서버가 시작되면 Telegram으로 인사 메시지가 자동 전송됩니다.
-            처음 실행 시에는 Chat ID가 아직 등록되지 않았으므로, Bot에게 아무 메시지나 한 번 보내면
-            Chat ID가 자동으로 저장되어 다음 시작부터 인사 메시지가 전송됩니다.
+            여러 봇을 동시에 운영하려면 토큰을 여러 개 전달하세요:
+            <code className="text-accent-cyan font-mono bg-bg-card px-1 py-0.5 rounded">cokacdir --ccserver TOKEN1 TOKEN2</code>
           </TipBox>
 
           {/* ========== 사용 가능한 명령어 ========== */}
@@ -712,10 +706,8 @@ export default function TelegramBot() {
                 No additional setup required on macOS. Open <strong className="text-zinc-300">Terminal.app</strong> or <strong className="text-zinc-300">iTerm2</strong> and run the commands below.
               </p>
               <div className="bg-bg-elevated border border-zinc-700 rounded p-3 text-sm font-mono">
-                <div className="text-zinc-500 mb-1"># Register token</div>
-                <div className="text-accent-cyan">cokacdir --ccsetkey YOUR_BOT_TOKEN</div>
-                <div className="text-zinc-500 mt-2 mb-1"># Start server</div>
-                <div className="text-accent-cyan">cokacdir --ccserver</div>
+                <div className="text-zinc-500 mb-1"># Start server</div>
+                <div className="text-accent-cyan">cokacdir --ccserver YOUR_BOT_TOKEN</div>
               </div>
               <p className="text-zinc-500 text-xs mt-2">
                 macOS path example: <code className="font-mono">/Users/username/Documents</code>
@@ -733,10 +725,8 @@ export default function TelegramBot() {
                 Open your terminal and run the commands below.
               </p>
               <div className="bg-bg-elevated border border-zinc-700 rounded p-3 text-sm font-mono">
-                <div className="text-zinc-500 mb-1"># Register token</div>
-                <div className="text-accent-cyan">cokacdir --ccsetkey YOUR_BOT_TOKEN</div>
-                <div className="text-zinc-500 mt-2 mb-1"># Start server</div>
-                <div className="text-accent-cyan">cokacdir --ccserver</div>
+                <div className="text-zinc-500 mb-1"># Start server</div>
+                <div className="text-accent-cyan">cokacdir --ccserver YOUR_BOT_TOKEN</div>
               </div>
               <p className="text-zinc-500 text-xs mt-2">
                 Linux path example: <code className="font-mono">/home/username/projects</code>
@@ -784,8 +774,7 @@ export default function TelegramBot() {
                 </p>
                 <div className="font-mono">
                   <div className="text-zinc-500 mb-1"># Run in WSL terminal</div>
-                  <div className="text-accent-cyan">cokacdir --ccsetkey YOUR_BOT_TOKEN</div>
-                  <div className="text-accent-cyan">cokacdir --ccserver</div>
+                  <div className="text-accent-cyan">cokacdir --ccserver YOUR_BOT_TOKEN</div>
                 </div>
               </div>
 
@@ -816,7 +805,7 @@ export default function TelegramBot() {
           <div className="bg-bg-card border border-zinc-800 rounded-lg p-4 mb-4">
             <div className="bg-bg-elevated border border-zinc-700 rounded p-3 text-sm font-mono mb-3">
               <div className="text-zinc-500 mb-1"># Background execution (macOS, Linux, WSL)</div>
-              <div className="text-accent-cyan">nohup cokacdir --ccserver &amp;</div>
+              <div className="text-accent-cyan">nohup cokacdir --ccserver YOUR_BOT_TOKEN &amp;</div>
             </div>
             <div className="bg-bg-elevated border border-zinc-700 rounded p-3 text-sm font-mono mb-3">
               <div className="text-zinc-500 mb-1"># Check if Bot server is running</div>
@@ -829,9 +818,8 @@ export default function TelegramBot() {
           </div>
 
           <TipBox>
-            When the server starts, a greeting message is automatically sent to Telegram.
-            On the first run, the Chat ID isn't registered yet — just send any message to the Bot
-            and it will be saved automatically. From the next start, the greeting will be sent.
+            To run multiple bots simultaneously, pass multiple tokens:
+            <code className="text-accent-cyan font-mono bg-bg-card px-1 py-0.5 rounded">cokacdir --ccserver TOKEN1 TOKEN2</code>
           </TipBox>
 
           {/* ========== Available Commands ========== */}
