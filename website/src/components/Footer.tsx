@@ -1,4 +1,4 @@
-import { Github, FileText, Cpu, GraduationCap } from 'lucide-react'
+import { Github, FileText, Cpu, GraduationCap, Cloud } from 'lucide-react'
 import { Link } from 'react-router-dom'
 
 export default function Footer() {
@@ -33,6 +33,13 @@ export default function Footer() {
             >
               <GraduationCap className="w-5 h-5" />
               <span className="text-sm">Tutorial</span>
+            </Link>
+            <Link
+              to="/ec2"
+              className="flex items-center gap-2 text-zinc-400 hover:text-white transition-colors"
+            >
+              <Cloud className="w-5 h-5" />
+              <span className="text-sm">EC2 Setup</span>
             </Link>
             <a
               href="https://github.com/kstost/cokacdir/blob/main/LICENSE"
