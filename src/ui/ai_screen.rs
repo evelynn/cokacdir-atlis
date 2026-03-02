@@ -373,9 +373,12 @@ const MAX_HISTORY_ITEMS: usize = 500;
 /// Session data structure for file persistence
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionData {
+    #[serde(default)]
     pub session_id: String,
+    #[serde(default)]
     pub history: Vec<HistoryItem>,
     pub current_path: String,
+    #[serde(default)]
     pub created_at: String,
     #[serde(default)]
     pub provider: String,
@@ -527,7 +530,7 @@ impl AIScreenState {
             input_lines: vec![String::new()],
             cursor_line: 0,
             cursor_col: 0,
-            session_id: Some(session_data.session_id),
+            session_id: if session_data.session_id.is_empty() { None } else { Some(session_data.session_id) },
             is_processing: false,
             scroll_offset: usize::MAX,  // Sentinel: scroll to bottom on first draw
             auto_scroll: true,

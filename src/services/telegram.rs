@@ -1157,7 +1157,9 @@ async fn handle_message(
                     session.current_path = Some(last_path.clone());
                     if let Some((session_data, _)) = existing {
                         msg_debug(&format!("[auto-restore] SUCCESS: session_id={}, history_len={}", session_data.session_id, session_data.history.len()));
-                        session.session_id = Some(session_data.session_id.clone());
+                        if !session_data.session_id.is_empty() {
+                            session.session_id = Some(session_data.session_id.clone());
+                        }
                         session.history = session_data.history.clone();
                     } else {
                         msg_debug("[auto-restore] FAIL: no session data found (local or external) → empty history");
@@ -1529,7 +1531,9 @@ async fn handle_start_command(
         });
 
         if let Some((session_data, _)) = &existing {
-            session.session_id = Some(session_data.session_id.clone());
+            if !session_data.session_id.is_empty() {
+                session.session_id = Some(session_data.session_id.clone());
+            }
             session.current_path = Some(canonical_path.clone());
             session.history = session_data.history.clone();
             msg_debug(&format!("[handle_start_command] restored: session_id={}, path={}, history_len={}",
@@ -2237,6 +2241,23 @@ async fn handle_workspace_resume(
     };
     msg_debug(&format!("[workspace_resume] canonical_path={:?}, provider={}", canonical_path, ws_provider));
     let existing = load_existing_session(&canonical_path, ws_provider);
+    msg_debug(&format!("[workspace_resume] load_existing_session → {}", if existing.is_some() { "found" } else { "None" }));
+
+    let existing = if existing.is_some() {
+        existing
+    } else {
+        let provider = if ws_provider == "codex" { SessionProvider::Codex } else { SessionProvider::Claude };
+        if let Some(info) = find_latest_session_by_cwd(&canonical_path, provider) {
+            msg_debug(&format!("[workspace_resume] fallback found: jsonl={}, session_id={}", info.jsonl_path.display(), info.session_id));
+            convert_and_save_session(&info, &canonical_path);
+            let reloaded = load_existing_session(&canonical_path, ws_provider);
+            msg_debug(&format!("[workspace_resume] after convert, reload → {}", if reloaded.is_some() { "found" } else { "None" }));
+            reloaded
+        } else {
+            msg_debug("[workspace_resume] no external session found either");
+            None
+        }
+    };
 
     let mut response_lines = Vec::new();
 
@@ -2250,7 +2271,9 @@ async fn handle_workspace_resume(
         });
 
         if let Some((session_data, _)) = &existing {
-            session.session_id = Some(session_data.session_id.clone());
+            if !session_data.session_id.is_empty() {
+                session.session_id = Some(session_data.session_id.clone());
+            }
             session.current_path = Some(canonical_path.clone());
             session.history = session_data.history.clone();
 
@@ -2321,7 +2344,7 @@ async fn handle_clear_command(
         let _ = tg!("delete_message", bot.delete_message(chat_id, msg_id).await);
     }
 
-    // Delete session file from disk so session_id is completely forgotten
+    // Overwrite session file with minimal data (keeps file present to block external restore)
     if let Some(ref path) = current_path {
         if let Some(sessions_dir) = crate::ui::ai_screen::ai_sessions_dir() {
             if let Ok(entries) = fs::read_dir(&sessions_dir) {
@@ -2333,7 +2356,10 @@ async fn handle_clear_command(
                                 if session_data.current_path == *path
                                     && (session_data.provider.is_empty() || session_data.provider == provider)
                                 {
-                                    let _ = fs::remove_file(&file_path);
+                                    let cleared = serde_json::json!({"current_path": *path});
+                                    if let Ok(json) = serde_json::to_string_pretty(&cleared) {
+                                        let _ = fs::write(&file_path, json);
+                                    }
                                 }
                             }
                         }
