@@ -684,6 +684,78 @@ struct SharedData {
 
 type SharedState = Arc<Mutex<SharedData>>;
 
+/// Auto-restore session from bot_settings.json if not in memory.
+/// Called before processing text messages and file uploads so that
+/// a server restart does not lose the active session.
+async fn auto_restore_session(state: &SharedState, chat_id: ChatId, user_name: &str) {
+    let mut data = state.lock().await;
+    if data.sessions.contains_key(&chat_id) {
+        return;
+    }
+    msg_debug(&format!("[auto-restore] no in-memory session for chat_id={}", chat_id.0));
+    let Some(last_path) = data.settings.last_sessions.get(&chat_id.0.to_string()).cloned() else {
+        msg_debug(&format!("[auto-restore] no last_path in settings for chat_id={}", chat_id.0));
+        return;
+    };
+    msg_debug(&format!("[auto-restore] last_path from settings: {:?}", last_path));
+    let is_dir = Path::new(&last_path).is_dir();
+    msg_debug(&format!("[auto-restore] is_dir({:?}) = {}", last_path, is_dir));
+    if !is_dir {
+        return;
+    }
+    let auto_model = get_model(&data.settings, chat_id);
+    let auto_provider = if auto_model.is_some() {
+        if codex::is_codex_model(auto_model.as_deref()) { "codex" } else { "claude" }
+    } else if !claude::is_claude_available() && codex::is_codex_available() {
+        "codex"
+    } else {
+        "claude"
+    };
+    msg_debug(&format!("[auto-restore] auto_provider={}, auto_model={:?}", auto_provider, auto_model));
+    msg_debug(&format!("[auto-restore] step1: load_existing_session(path={:?}, provider={:?})", last_path, auto_provider));
+    let existing = load_existing_session(&last_path, auto_provider)
+        .or_else(|| {
+            msg_debug("[auto-restore] step1 returned None → trying fallback from external source");
+            let provider = if auto_provider == "codex" {
+                SessionProvider::Codex
+            } else {
+                SessionProvider::Claude
+            };
+            msg_debug(&format!("[auto-restore] step2: find_latest_session_by_cwd(path={:?}, provider={:?})", last_path, auto_provider));
+            if let Some(info) = find_latest_session_by_cwd(&last_path, provider) {
+                msg_debug(&format!("[auto-restore] step2 found: jsonl={}, session_id={}", info.jsonl_path.display(), info.session_id));
+                convert_and_save_session(&info, &last_path);
+                msg_debug("[auto-restore] step3: reload from ai_sessions after convert");
+                let reloaded = load_existing_session(&last_path, auto_provider);
+                msg_debug(&format!("[auto-restore] step3 result: {}", if reloaded.is_some() { "found" } else { "None" }));
+                reloaded
+            } else {
+                msg_debug("[auto-restore] step2 returned None → no external session found");
+                None
+            }
+        });
+    let session = data.sessions.entry(chat_id).or_insert_with(|| ChatSession {
+        session_id: None,
+        current_path: None,
+        history: Vec::new(),
+        pending_uploads: Vec::new(),
+    });
+    session.current_path = Some(last_path.clone());
+    if let Some((session_data, _)) = existing {
+        msg_debug(&format!("[auto-restore] SUCCESS: session_id={}, history_len={}", session_data.session_id, session_data.history.len()));
+        if !session_data.session_id.is_empty() {
+            session.session_id = Some(session_data.session_id.clone());
+        } else {
+            cleanup_session_files(&last_path, auto_provider);
+        }
+        session.history = session_data.history.clone();
+    } else {
+        msg_debug("[auto-restore] FAIL: no session data found (local or external) → empty history");
+    }
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    println!("  [{ts}] ↻ [{user_name}] Auto-restored session: {last_path}");
+}
+
 /// Telegram message length limit
 const TELEGRAM_MSG_LIMIT: usize = 4096;
 
@@ -1036,6 +1108,11 @@ async fn handle_message(
 
     let user_name = format!("{}({uid})", raw_user_name);
 
+    // Auto-restore session for file uploads (before text extraction)
+    if msg.document().is_some() || msg.photo().is_some() {
+        auto_restore_session(&state, chat_id, &user_name).await;
+    }
+
     // Handle file/photo uploads
     if msg.document().is_some() || msg.photo().is_some() {
         // In group chats, only process uploads whose caption starts with ';'
@@ -1112,70 +1189,7 @@ async fn handle_message(
 
     // Auto-restore session from bot_settings.json if not in memory
     if !text.starts_with("/start") {
-        let mut data = state.lock().await;
-        if !data.sessions.contains_key(&chat_id) {
-            msg_debug(&format!("[auto-restore] no in-memory session for chat_id={}", chat_id.0));
-            if let Some(last_path) = data.settings.last_sessions.get(&chat_id.0.to_string()).cloned() {
-                msg_debug(&format!("[auto-restore] last_path from settings: {:?}", last_path));
-                let is_dir = Path::new(&last_path).is_dir();
-                msg_debug(&format!("[auto-restore] is_dir({:?}) = {}", last_path, is_dir));
-                if is_dir {
-                    let auto_model = get_model(&data.settings, chat_id);
-                    let auto_provider = if auto_model.is_some() {
-                        if codex::is_codex_model(auto_model.as_deref()) { "codex" } else { "claude" }
-                    } else if !claude::is_claude_available() && codex::is_codex_available() {
-                        "codex"
-                    } else {
-                        "claude"
-                    };
-                    msg_debug(&format!("[auto-restore] auto_provider={}, auto_model={:?}", auto_provider, auto_model));
-                    msg_debug(&format!("[auto-restore] step1: load_existing_session(path={:?}, provider={:?})", last_path, auto_provider));
-                    let existing = load_existing_session(&last_path, auto_provider)
-                        .or_else(|| {
-                            msg_debug("[auto-restore] step1 returned None → trying fallback from external source");
-                            let provider = if auto_provider == "codex" {
-                                SessionProvider::Codex
-                            } else {
-                                SessionProvider::Claude
-                            };
-                            msg_debug(&format!("[auto-restore] step2: find_latest_session_by_cwd(path={:?}, provider={:?})", last_path, auto_provider));
-                            if let Some(info) = find_latest_session_by_cwd(&last_path, provider) {
-                                msg_debug(&format!("[auto-restore] step2 found: jsonl={}, session_id={}", info.jsonl_path.display(), info.session_id));
-                                convert_and_save_session(&info, &last_path);
-                                msg_debug("[auto-restore] step3: reload from ai_sessions after convert");
-                                let reloaded = load_existing_session(&last_path, auto_provider);
-                                msg_debug(&format!("[auto-restore] step3 result: {}", if reloaded.is_some() { "found" } else { "None" }));
-                                reloaded
-                            } else {
-                                msg_debug("[auto-restore] step2 returned None → no external session found");
-                                None
-                            }
-                        });
-                    let session = data.sessions.entry(chat_id).or_insert_with(|| ChatSession {
-                        session_id: None,
-                        current_path: None,
-                        history: Vec::new(),
-                        pending_uploads: Vec::new(),
-                    });
-                    session.current_path = Some(last_path.clone());
-                    if let Some((session_data, _)) = existing {
-                        msg_debug(&format!("[auto-restore] SUCCESS: session_id={}, history_len={}", session_data.session_id, session_data.history.len()));
-                        if !session_data.session_id.is_empty() {
-                            session.session_id = Some(session_data.session_id.clone());
-                        } else {
-                            cleanup_session_files(&last_path, auto_provider);
-                        }
-                        session.history = session_data.history.clone();
-                    } else {
-                        msg_debug("[auto-restore] FAIL: no session data found (local or external) → empty history");
-                    }
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    println!("  [{ts}] ↻ [{user_name}] Auto-restored session: {last_path}");
-                }
-            } else {
-                msg_debug(&format!("[auto-restore] no last_path in settings for chat_id={}", chat_id.0));
-            }
-        }
+        auto_restore_session(&state, chat_id, &user_name).await;
     }
 
     // In group chats, ignore plain text (only /, !, ; prefixed messages are processed)
