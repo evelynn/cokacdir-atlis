@@ -71,7 +71,7 @@ const groups: ShortcutGroup[] = [
     enDesc: 'Create, modify, delete',
     koDesc: '만들기, 바꾸기, 지우기',
     shortcuts: [
-      { key: <KeyBadge>K</KeyBadge>, en: 'New folder', ko: '새 폴더 만들기' },
+      { key: <KeyBadge>,</KeyBadge>, en: 'New folder', ko: '새 폴더 만들기' },
       { key: <KeyBadge>M</KeyBadge>, en: 'New file', ko: '새 파일 만들기' },
       { key: <KeyBadge>R</KeyBadge>, en: 'Rename', ko: '이름 바꾸기' },
       { key: <KeyBadge>E</KeyBadge>, en: 'Edit file', ko: '파일 편집' },
@@ -105,7 +105,7 @@ const groups: ShortcutGroup[] = [
       { key: <KeyBadge>P</KeyBadge>, en: 'Process manager', ko: '프로세스 관리자' },
       { key: <KeyBadge>'</KeyBadge>, en: 'Toggle bookmark', ko: '북마크 등록/해제' },
       { key: <KeyBadge>`</KeyBadge>, en: 'Settings', ko: '설정' },
-      { key: <KeyBadge>H</KeyBadge>, en: 'Help', ko: '도움말' },
+      { key: <KeyBadge>?</KeyBadge>, en: 'Help', ko: '도움말' },
       { key: <KeyBadge>Q</KeyBadge>, en: 'Quit', ko: '종료' },
     ],
   },
@@ -156,7 +156,7 @@ export default function KeyboardReference() {
           <TipBox>
             이 단축키들은 메인 파일 목록 화면에서 사용하는 키입니다.
             에디터, 뷰어, AI 화면 등 각 화면마다 고유한 단축키가 있으며,
-            해당 화면에서 <KeyBadge>H</KeyBadge>를 누르면 그 화면의 단축키를 볼 수 있습니다.
+            해당 화면에서 <KeyBadge>?</KeyBadge>를 누르면 그 화면의 단축키를 볼 수 있습니다.
           </TipBox>
 
           <TipBox variant="note">
@@ -172,7 +172,7 @@ export default function KeyboardReference() {
               이제 직접 사용해보면서 익숙해져 보세요.
             </p>
             <p className="text-zinc-500 text-sm">
-              막히는 것이 있으면 언제든 <KeyBadge>H</KeyBadge>를 눌러 도움말을 확인하거나,
+              막히는 것이 있으면 언제든 <KeyBadge>?</KeyBadge>를 눌러 도움말을 확인하거나,
               이 페이지로 돌아와서 참고하세요.
             </p>
           </div>
@@ -182,7 +182,7 @@ export default function KeyboardReference() {
           <TipBox>
             These shortcuts are for the main file list screen.
             Each screen (editor, viewer, AI, etc.) has its own shortcuts —
-            press <KeyBadge>H</KeyBadge> in any screen to see its available shortcuts.
+            press <KeyBadge>?</KeyBadge> in any screen to see its available shortcuts.
           </TipBox>
 
           <TipBox variant="note">
@@ -198,7 +198,7 @@ export default function KeyboardReference() {
               Now try it yourself and get comfortable.
             </p>
             <p className="text-zinc-500 text-sm">
-              If you get stuck, press <KeyBadge>H</KeyBadge> anytime for help,
+              If you get stuck, press <KeyBadge>?</KeyBadge> anytime for help,
               or come back to this page for reference.
             </p>
           </div>

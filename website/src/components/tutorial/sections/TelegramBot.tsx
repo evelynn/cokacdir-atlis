@@ -514,7 +514,7 @@ export default function TelegramBot() {
               <div className="bg-bg-elevated rounded p-3 mt-2 space-y-1">
                 <p className="text-zinc-500 text-xs font-semibold mb-2">Codex</p>
                 <code className="block text-zinc-500 font-mono text-sm">/model codex</code>
-                <code className="block text-zinc-500 font-mono text-sm">/model codex:gpt-5.3-codex</code>
+                <code className="block text-zinc-500 font-mono text-sm">/model codex:gpt-5.4</code>
               </div>
               <p className="text-zinc-400 text-sm leading-relaxed mt-2">
                 provider를 전환하면 (예: claude → codex) 기존 세션에서 빠져나옵니다. 다시 <code className="text-zinc-300 font-mono bg-bg-elevated px-1 py-0.5 rounded">/start</code>로 세션을 시작해야 합니다.
@@ -1369,7 +1369,7 @@ export default function TelegramBot() {
               <div className="bg-bg-elevated rounded p-3 mt-2 space-y-1">
                 <p className="text-zinc-500 text-xs font-semibold mb-2">Codex</p>
                 <code className="block text-zinc-500 font-mono text-sm">/model codex</code>
-                <code className="block text-zinc-500 font-mono text-sm">/model codex:gpt-5.3-codex</code>
+                <code className="block text-zinc-500 font-mono text-sm">/model codex:gpt-5.4</code>
               </div>
               <p className="text-zinc-400 text-sm leading-relaxed mt-2">
                 Switching providers (e.g., claude → codex) will exit the current session. You'll need to run <code className="text-zinc-300 font-mono bg-bg-elevated px-1 py-0.5 rounded">/start</code> again to begin a new session.

@@ -197,13 +197,13 @@ export default function BookmarksHelp() {
           <div className="space-y-3 mb-6">
             <div className="bg-bg-card border border-zinc-800 rounded-lg p-4">
               <div className="flex items-center gap-3 mb-2">
-                <KeyBadge>H</KeyBadge>
+                <KeyBadge>?</KeyBadge>
                 <span className="text-white font-semibold">도움말 열기</span>
               </div>
               <p className="text-zinc-400 text-sm">
-                <KeyBadge>H</KeyBadge>를 누르면 현재 화면에서 사용할 수 있는 모든 단축키 목록이 표시됩니다.
+                <KeyBadge>?</KeyBadge>를 누르면 현재 화면에서 사용할 수 있는 모든 단축키 목록이 표시됩니다.
                 위아래 화살표나 <KeyBadge>PgUp</KeyBadge><KeyBadge>PgDn</KeyBadge>으로 스크롤할 수 있습니다.
-                다 봤으면 <KeyBadge>Esc</KeyBadge>나 <KeyBadge>Q</KeyBadge> 또는 <KeyBadge>H</KeyBadge>를 다시 눌러 닫습니다.
+                다 봤으면 <KeyBadge>Esc</KeyBadge>나 <KeyBadge>Q</KeyBadge> 또는 <KeyBadge>?</KeyBadge>를 다시 눌러 닫습니다.
               </p>
             </div>
           </div>
@@ -221,8 +221,8 @@ export default function BookmarksHelp() {
           </div>
 
           <TipBox>
-            언제든 <KeyBadge>H</KeyBadge>를 누르면 도움말이 나오니 단축키를 무리해서 외울 필요가 없습니다.
-            자주 쓰는 키는 자연스럽게 손에 익고, 가끔 쓰는 키는 그때그때 <KeyBadge>H</KeyBadge>로 확인하면 됩니다.
+            언제든 <KeyBadge>?</KeyBadge>를 누르면 도움말이 나오니 단축키를 무리해서 외울 필요가 없습니다.
+            자주 쓰는 키는 자연스럽게 손에 익고, 가끔 쓰는 키는 그때그때 <KeyBadge>?</KeyBadge>로 확인하면 됩니다.
           </TipBox>
         </>
       ) : (
@@ -411,13 +411,13 @@ export default function BookmarksHelp() {
           <div className="space-y-3 mb-6">
             <div className="bg-bg-card border border-zinc-800 rounded-lg p-4">
               <div className="flex items-center gap-3 mb-2">
-                <KeyBadge>H</KeyBadge>
+                <KeyBadge>?</KeyBadge>
                 <span className="text-white font-semibold">Open Help</span>
               </div>
               <p className="text-zinc-400 text-sm">
-                Press <KeyBadge>H</KeyBadge> to see all available keyboard shortcuts for the current screen.
+                Press <KeyBadge>?</KeyBadge> to see all available keyboard shortcuts for the current screen.
                 Scroll with arrow keys or <KeyBadge>PgUp</KeyBadge><KeyBadge>PgDn</KeyBadge>.
-                Close with <KeyBadge>Esc</KeyBadge>, <KeyBadge>Q</KeyBadge>, or press <KeyBadge>H</KeyBadge> again.
+                Close with <KeyBadge>Esc</KeyBadge>, <KeyBadge>Q</KeyBadge>, or press <KeyBadge>?</KeyBadge> again.
               </p>
             </div>
           </div>
@@ -435,8 +435,8 @@ export default function BookmarksHelp() {
           </div>
 
           <TipBox>
-            You can always press <KeyBadge>H</KeyBadge> for help, so there's no need to memorize every shortcut.
-            Frequently used keys will become muscle memory, and for rarely used ones, just check <KeyBadge>H</KeyBadge>.
+            You can always press <KeyBadge>?</KeyBadge> for help, so there's no need to memorize every shortcut.
+            Frequently used keys will become muscle memory, and for rarely used ones, just check <KeyBadge>?</KeyBadge>.
           </TipBox>
         </>
       )}

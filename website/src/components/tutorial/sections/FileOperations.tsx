@@ -22,11 +22,11 @@ export default function FileOperations() {
           <div className="space-y-4 mb-6">
             <div className="bg-bg-card border border-zinc-800 rounded-lg p-4">
               <div className="flex items-center gap-3 mb-2">
-                <KeyBadge>K</KeyBadge>
+                <KeyBadge>,</KeyBadge>
                 <span className="text-white font-semibold">새 폴더 만들기</span>
               </div>
               <p className="text-zinc-400 text-sm">
-                <KeyBadge>K</KeyBadge>를 누르면 이름을 입력하는 창이 나타납니다.
+                <KeyBadge>,</KeyBadge>를 누르면 이름을 입력하는 창이 나타납니다.
                 원하는 폴더 이름을 입력하고 Enter를 누르면 현재 위치에 새 폴더가 만들어집니다.
               </p>
             </div>
@@ -311,11 +311,11 @@ export default function FileOperations() {
           <div className="space-y-4 mb-6">
             <div className="bg-bg-card border border-zinc-800 rounded-lg p-4">
               <div className="flex items-center gap-3 mb-2">
-                <KeyBadge>K</KeyBadge>
+                <KeyBadge>,</KeyBadge>
                 <span className="text-white font-semibold">Create New Folder</span>
               </div>
               <p className="text-zinc-400 text-sm">
-                Press <KeyBadge>K</KeyBadge> and a name input prompt appears.
+                Press <KeyBadge>,</KeyBadge> and a name input prompt appears.
                 Type the folder name and press Enter to create a new folder in the current location.
               </p>
             </div>

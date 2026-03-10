@@ -314,13 +314,13 @@ pub fn default_panel_keybindings() -> HashMap<PanelAction, Vec<String>> {
 
     // General
     m.insert(PanelAction::Quit, vec!["//Quit program".into(), "q".into()]);
-    m.insert(PanelAction::Help, vec!["//Show help screen".into(), "h".into()]);
+    m.insert(PanelAction::Help, vec!["//Show help screen".into(), "?".into()]);
     m.insert(PanelAction::Settings, vec!["//Open settings dialog".into(), "`".into()]);
     m.insert(PanelAction::Refresh, vec!["//Refresh panels".into(), "2".into()]);
 
     // Navigation
-    m.insert(PanelAction::MoveUp, vec!["//Move cursor up".into(), "up".into()]);
-    m.insert(PanelAction::MoveDown, vec!["//Move cursor down".into(), "down".into()]);
+    m.insert(PanelAction::MoveUp, vec!["//Move cursor up".into(), "up".into(), "k".into()]);
+    m.insert(PanelAction::MoveDown, vec!["//Move cursor down".into(), "down".into(), "j".into()]);
     m.insert(PanelAction::PageUp, vec!["//Page up (10 lines)".into(), "pageup".into()]);
     m.insert(PanelAction::PageDown, vec!["//Page down (10 lines)".into(), "pagedown".into()]);
     m.insert(PanelAction::GoHome, vec!["//Go to first item".into(), "home".into()]);
@@ -332,8 +332,8 @@ pub fn default_panel_keybindings() -> HashMap<PanelAction, Vec<String>> {
 
     // Panel
     m.insert(PanelAction::SwitchPanel, vec!["//Switch to next panel".into(), "tab".into()]);
-    m.insert(PanelAction::SwitchPanelLeft, vec!["//Switch to left panel".into(), "left".into()]);
-    m.insert(PanelAction::SwitchPanelRight, vec!["//Switch to right panel".into(), "right".into()]);
+    m.insert(PanelAction::SwitchPanelLeft, vec!["//Switch to left panel".into(), "left".into(), "h".into()]);
+    m.insert(PanelAction::SwitchPanelRight, vec!["//Switch to right panel".into(), "right".into(), "l".into()]);
     m.insert(PanelAction::AddPanel, vec!["//Add new panel".into(), "0".into()]);
     m.insert(PanelAction::ClosePanel, vec!["//Close current panel".into(), "9".into()]);
 
@@ -361,7 +361,7 @@ pub fn default_panel_keybindings() -> HashMap<PanelAction, Vec<String>> {
     // File operations
     m.insert(PanelAction::FileInfo, vec!["//Show file info".into(), "i".into()]);
     m.insert(PanelAction::Edit, vec!["//Edit file".into(), "e".into()]);
-    m.insert(PanelAction::Mkdir, vec!["//Create directory".into(), "k".into()]);
+    m.insert(PanelAction::Mkdir, vec!["//Create directory".into(), ",".into()]);
     m.insert(PanelAction::Mkfile, vec!["//Create file".into(), "m".into()]);
     m.insert(PanelAction::Delete, vec!["//Delete file".into(), "x".into(), "delete".into(), "backspace".into()]);
     m.insert(PanelAction::Rename, vec!["//Rename file".into(), "r".into()]);

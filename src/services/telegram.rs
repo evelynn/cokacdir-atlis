@@ -71,7 +71,7 @@ struct BotSettings {
     owner_user_id: Option<u64>,
     /// chat_id (string) → true if group chat is public (non-owner users allowed)
     as_public_for_group_chat: HashMap<String, bool>,
-    /// chat_id (string) → model name (e.g. "claude", "claude:claude-sonnet-4-6", "codex:gpt-5.3-codex")
+    /// chat_id (string) → model name (e.g. "claude", "claude:claude-sonnet-4-6", "codex:gpt-5.4")
     models: HashMap<String, String>,
     /// Debug logging toggle
     debug: bool,
@@ -3393,16 +3393,13 @@ async fn handle_model_command(
         if has_codex {
             msg.push_str("\n<b>Codex:</b>\n");
             msg.push_str("<code>/model codex</code> — default\n");
-            msg.push_str("<code>/model codex:gpt-5.3-codex</code>\n");
-            msg.push_str("<code>/model codex:gpt-5.2-codex</code>\n");
-            msg.push_str("<code>/model codex:gpt-5.2</code>\n");
-            msg.push_str("<code>/model codex:gpt-5.1-codex-max</code>\n");
-            msg.push_str("<code>/model codex:gpt-5.1-codex</code>\n");
-            msg.push_str("<code>/model codex:gpt-5.1</code>\n");
-            msg.push_str("<code>/model codex:gpt-5-codex</code>\n");
-            msg.push_str("<code>/model codex:gpt-5</code>\n");
-            msg.push_str("<code>/model codex:gpt-5.1-codex-mini</code>\n");
-            msg.push_str("<code>/model codex:gpt-5-codex-mini</code>\n");
+            msg.push_str("<code>/model codex:gpt-5.4</code> — Latest frontier agentic coding model\n");
+            msg.push_str("<code>/model codex:gpt-5.3-codex</code> — Frontier Codex-optimized agentic coding model\n");
+            msg.push_str("<code>/model codex:gpt-5.3-codex-spark</code> — Ultra-fast coding model\n");
+            msg.push_str("<code>/model codex:gpt-5.2-codex</code> — Frontier agentic coding model\n");
+            msg.push_str("<code>/model codex:gpt-5.2</code> — Optimized for professional work and long-running agents\n");
+            msg.push_str("<code>/model codex:gpt-5.1-codex-max</code> — Codex-optimized model for deep and fast reasoning\n");
+            msg.push_str("<code>/model codex:gpt-5.1-codex-mini</code> — Optimized for codex. Cheaper, faster, but less capable\n");
         }
 
         shared_rate_limit_wait(state, chat_id).await;

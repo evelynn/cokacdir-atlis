@@ -134,7 +134,7 @@ pub fn handle_input(app: &mut App, code: KeyCode) -> bool {
             false
         }
         // Close help screen
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Char('h') | KeyCode::Char('H') => {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Char('?') => {
             state.scroll_offset = 0; // Reset scroll for next time
             true
         }
