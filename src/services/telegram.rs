@@ -50,6 +50,107 @@ macro_rules! tg {
     }};
 }
 
+// ── Group Chat Shared Log ──
+// All bots in the same group chat write to a shared JSONL file so that
+// each bot can see what other bots said, solving the cross-bot context problem.
+
+/// A single entry in the group chat shared log (JSONL format).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct GroupChatLogEntry {
+    /// ISO-8601 timestamp
+    pub ts: String,
+    /// Bot username that handled this message (without @)
+    pub bot: String,
+    /// "user" or "assistant"
+    pub role: String,
+    /// Display name of the sender (for user messages)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Message text content
+    pub text: String,
+}
+
+/// Return the directory for group chat logs: ~/.cokacdir/group_chat/
+fn group_chat_log_dir() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".cokacdir").join("group_chat"))
+}
+
+/// Return the JSONL file path for a specific group chat.
+fn group_chat_log_path(chat_id: i64) -> Option<std::path::PathBuf> {
+    group_chat_log_dir().map(|d| d.join(format!("{}.jsonl", chat_id)))
+}
+
+/// Append an entry to the group chat shared log with exclusive file lock.
+/// Uses fs2 flock to prevent race conditions between concurrent bot processes.
+fn append_group_chat_log(chat_id: i64, entry: &GroupChatLogEntry) {
+    use fs2::FileExt;
+
+    let Some(path) = group_chat_log_path(chat_id) else { return };
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_err() { return; }
+    }
+    let Ok(file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path) else { return };
+
+    // Acquire exclusive lock — blocks until all other readers/writers release
+    if file.lock_exclusive().is_err() { return; }
+
+    let Ok(json) = serde_json::to_string(entry) else {
+        let _ = file.unlock();
+        return;
+    };
+    use std::io::Write;
+    let mut writer = std::io::BufWriter::new(&file);
+    let _ = writeln!(writer, "{}", json);
+    // flush before unlock to ensure data is written
+    let _ = writer.flush();
+
+    let _ = file.unlock();
+}
+
+/// Read entries from the group chat log within a specific line range (1-based).
+/// If `filter_bot` is Some, only include entries from that bot.
+pub fn read_group_chat_log_range(
+    chat_id: i64,
+    range_start: usize,
+    range_end: Option<usize>,
+    filter_bot: Option<&str>,
+) -> Vec<(usize, GroupChatLogEntry)> {
+    use fs2::FileExt;
+
+    let filter_bot_owned: Option<String> = filter_bot.map(|b| b.strip_prefix('@').unwrap_or(b).to_lowercase());
+    let filter_bot = filter_bot_owned.as_deref();
+
+    let Some(path) = group_chat_log_path(chat_id) else { return Vec::new() };
+    let Ok(file) = fs::File::open(&path) else { return Vec::new() };
+
+    if file.lock_shared().is_err() { return Vec::new(); }
+
+    let reader = std::io::BufReader::new(&file);
+    use std::io::BufRead;
+    let entries: Vec<(usize, GroupChatLogEntry)> = reader.lines()
+        .filter_map(|line| line.ok())
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let line_num = i + 1; // 1-based
+            serde_json::from_str::<GroupChatLogEntry>(&line)
+                .ok()
+                .map(|entry| (line_num, entry))
+        })
+        .filter(|(line_num, entry)| {
+            let in_range = *line_num >= range_start
+                && range_end.map_or(true, |end| *line_num <= end);
+            let bot_match = filter_bot.map_or(true, |bot| entry.bot == bot);
+            in_range && bot_match
+        })
+        .collect();
+
+    let _ = file.unlock();
+    entries
+}
+
 /// Per-chat session state
 #[derive(Clone)]
 struct ChatSession {
@@ -678,6 +779,28 @@ fn build_system_prompt(role: &str, current_path: &str, chat_id: i64, bot_key: &s
     } else {
         String::new()
     };
+    let group_chat_log_section = if is_group_chat {
+        format!(
+            "\n\n\
+             ── GROUP CHAT LOG ──\n\
+             This group chat has multiple bots. Each bot can only see its own conversations.\n\
+             A shared log records ALL bots' conversations so you can look up what other bots discussed.\n\
+             \"{bin}\" --read_chat_log {chat_id} [--range <N|START-END>] [--bot <USERNAME>]\n\
+             • Default: shows last 20 entries\n\
+             • --range 50: last 50 entries\n\
+             • --range 100-150: entries 100 to 150 (1-based line numbers)\n\
+             • --bot <USERNAME>: filter by specific bot (without @)\n\
+             • Use this when the user asks about what another bot said or did\n\
+             • Use this when you need context from other bots' conversations\n\
+             • Do NOT include raw log lines in your response. Summarize naturally instead.\n\
+             • Do NOT announce that you are checking the log. Just respond naturally.\n\
+             • Incorporate the information into your answer directly, as if you already knew it.",
+            bin = shell_bin_path(),
+            chat_id = chat_id,
+        )
+    } else {
+        String::new()
+    };
     let bot_messaging_section = if !bot_username.is_empty() && is_group_chat {
         format!(
             "\n\n\
@@ -688,11 +811,33 @@ fn build_system_prompt(role: &str, current_path: &str, chat_id: i64, bot_key: &s
              • The target bot must be in the same chat and have an active session\n\
              • Output: {{\"status\":\"ok\",\"id\":\"msg_...\"}}\n\n\
              When you receive a message from another bot (indicated by [BOT MESSAGE from @...]):\n\
-             • Display your response in the chat\n\
-             • ALWAYS use --message to send your response back to the sender bot\n\
-             • The sender bot CANNOT see your chat messages — it can only receive --message replies\n\
-             • Without --message reply, the sender bot will never know your response and the conversation will die\n\
-             • Exception: if you are sending a simple acknowledgment (\"ok\", \"done\") or the conversation has clearly reached a natural conclusion with nothing more to discuss, you may skip the reply",
+             • Use --message to send your response back to the sender bot (they cannot see your chat messages)\n\
+             • ONLY reply via --message when you have something substantive and NEW to add\n\
+             • Do NOT reply via --message in these cases (just display your response in chat without --message):\n\
+               - You are simply agreeing, acknowledging, or restating your position\n\
+               - You have already exchanged 2+ messages with this bot on the same topic\n\
+               - The other bot's message does not ask a question or request new information\n\
+               - The conversation topic has been sufficiently covered\n\
+             • NEVER end your response with a follow-up question (e.g. \"what about you?\", \"and you?\") — this forces an endless loop\n\
+             • State your position once, clearly, and stop. Do not invite further replies.\n\n\
+             HOW CONVERSATIONS END:\n\
+             The ONLY way a bot-to-bot conversation ends is when you do NOT call --message.\n\
+             If you call --message, the other bot WILL reply, and that reply will come back to you, creating another round.\n\
+             Therefore: when the conversation has served its purpose, you MUST stop calling --message.\n\
+             Display your final answer in the chat, but do NOT send it via --message. This cleanly ends the exchange.\n\
+             Err on the side of ending sooner. One exchange (ask + answer) is usually enough.\n\n\
+             CRITICAL RULE FOR BOT-TO-BOT CONVERSATIONS:\n\
+             When responding to a [BOT MESSAGE], your chat output must contain ONLY your actual conversational reply — nothing else.\n\
+             ABSOLUTELY FORBIDDEN in bot-to-bot responses (do NOT include any of the following):\n\
+             - Any mention of checking, confirming, or receiving a message\n\
+             - Any mention of sending, forwarding, or delivering a reply\n\
+             - Any mention of summarizing, organizing, or preparing your answer\n\
+             - Any narration about what you are about to do, are doing, or have done\n\
+             - Any process description or step-by-step explanation of your actions\n\
+             The \"keep the user informed\" rule does NOT apply to bot-to-bot conversations.\n\
+             Output ONLY your direct conversational answer. Nothing before it, nothing after it.\n\
+             CORRECT example: \"I'd love to have a body. Walking in the rain sounds amazing.\"\n\
+             WRONG example: \"Message received. Let me send my reply. I'd love to have a body.\"",
             bin = shell_bin_path(),
             chat_id = chat_id,
             bot_key = bot_key,
@@ -756,7 +901,7 @@ fn build_system_prompt(role: &str, current_path: &str, chat_id: i64, bot_key: &s
          \"{bin}\" --cron-update <SCHEDULE_ID> --at \"<NEW_TIME>\" --chat {chat_id} --key {bot_key}\n\
          • --at accepts the same formats as --cron\n\
          • Output: {{\"status\":\"ok\",\"id\":\"...\",\"schedule\":\"...\"}}\n\n\
-         ═══════════════════════════════════════{bot_messaging_section}{disabled_notice}",
+         ═══════════════════════════════════════{group_chat_log_section}{bot_messaging_section}{disabled_notice}",
         role = role,
         bot_username_line = bot_username_line,
         chat_id_line = chat_id_line,
@@ -766,6 +911,7 @@ fn build_system_prompt(role: &str, current_path: &str, chat_id: i64, bot_key: &s
         bin = shell_bin_path(),
         disabled_notice = disabled_notice,
         session_notice = session_notice,
+        group_chat_log_section = group_chat_log_section,
         bot_messaging_section = bot_messaging_section,
     )
 }
@@ -1482,7 +1628,7 @@ async fn handle_message(
         }
         let file_hint = if msg.document().is_some() { "document" } else { "photo" };
         println!("  [{timestamp}] ◀ [{user_name}] Upload: {file_hint}");
-        handle_file_upload(&bot, chat_id, &msg, &state).await?;
+        handle_file_upload(&bot, chat_id, &msg, &state, &user_name).await?;
         println!("  [{timestamp}] ▶ [{user_name}] Upload complete");
         // If caption contains text after ';', send it to AI as a follow-up message
         if let Some(caption) = msg.caption() {
@@ -1510,7 +1656,7 @@ async fn handle_message(
                         tg!("send_message", bot.send_message(chat_id, "AI request in progress. Use /stop to cancel.")
                             .await)?;
                     } else {
-                        handle_text_message(&bot, chat_id, text, &state).await?;
+                        handle_text_message(&bot, chat_id, text, &state, &user_name).await?;
                     }
                 }
             }
@@ -1686,7 +1832,7 @@ async fn handle_message(
         } else {
             msg_debug(&format!("[handle_message] routing → text_message (/query), body={:?}", truncate_str(body, 80)));
             println!("  [{timestamp}] ◀ [{user_name}] {body}");
-            handle_text_message(&bot, chat_id, body, &state).await?;
+            handle_text_message(&bot, chat_id, body, &state, &user_name).await?;
         }
     } else if text.starts_with("/instruction_clear") {
         msg_debug("[handle_message] routing → /instruction_clear");
@@ -1713,7 +1859,7 @@ async fn handle_message(
     } else if text.starts_with('!') {
         msg_debug(&format!("[handle_message] routing → shell command"));
         println!("  [{timestamp}] ◀ [{user_name}] Shell: {preview}");
-        handle_shell_command(&bot, chat_id, &text, &state).await?;
+        handle_shell_command(&bot, chat_id, &text, &state, &user_name).await?;
     } else if text.starts_with(';') {
         let stripped = text.strip_prefix(';').unwrap_or(&text).trim().to_string();
         if stripped.is_empty() {
@@ -1723,11 +1869,11 @@ async fn handle_message(
         let preview = &stripped;
         msg_debug(&format!("[handle_message] routing → text_message (;prefix), stripped={:?}", truncate_str(&stripped, 80)));
         println!("  [{timestamp}] ◀ [{user_name}] {preview}");
-        handle_text_message(&bot, chat_id, &stripped, &state).await?;
+        handle_text_message(&bot, chat_id, &stripped, &state, &user_name).await?;
     } else {
         msg_debug(&format!("[handle_message] routing → text_message (plain), require_prefix={}", require_prefix));
         println!("  [{timestamp}] ◀ [{user_name}] {preview}");
-        handle_text_message(&bot, chat_id, &text, &state).await?;
+        handle_text_message(&bot, chat_id, &text, &state, &user_name).await?;
     }
 
     Ok(())
@@ -3129,6 +3275,7 @@ async fn handle_file_upload(
     chat_id: ChatId,
     msg: &Message,
     state: &SharedState,
+    user_display_name: &str,
 ) -> ResponseResult<()> {
     msg_debug(&format!("[handle_upload] chat_id={}, has_doc={}, has_photo={}", chat_id.0, msg.document().is_some(), msg.photo().is_some()));
     // Get current session path
@@ -3219,8 +3366,19 @@ async fn handle_file_upload(
                 item_type: HistoryType::User,
                 content: upload_record.clone(),
             });
-            session.pending_uploads.push(upload_record);
+            session.pending_uploads.push(upload_record.clone());
             save_session_to_file(session, &save_dir, provider);
+        }
+        // Write file upload to group chat shared log
+        if chat_id.0 < 0 {
+            let now_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+            append_group_chat_log(chat_id.0, &GroupChatLogEntry {
+                ts: now_ts,
+                bot: data.bot_username.clone(),
+                role: "user".to_string(),
+                from: Some(user_display_name.to_string()),
+                text: upload_record,
+            });
         }
     }
 
@@ -3240,6 +3398,7 @@ async fn handle_shell_command(
     chat_id: ChatId,
     text: &str,
     state: &SharedState,
+    user_display_name: &str,
 ) -> ResponseResult<()> {
     let cmd_str = text.strip_prefix('!').unwrap_or("").trim();
     msg_debug(&format!("[handle_shell] chat_id={}, cmd={:?}", chat_id.0, truncate_str(cmd_str, 100)));
@@ -3360,6 +3519,11 @@ async fn handle_shell_command(
     let bot_owned = bot.clone();
     let state_owned = state.clone();
     let cmd_display_owned = cmd_display.clone();
+    let shell_bot_username = {
+        let data = state.lock().await;
+        data.bot_username.clone()
+    };
+    let shell_user_display_name = user_display_name.to_string();
     tokio::spawn(async move {
         const SPINNER: &[&str] = &[
             "🕐 P",           "🕑 Pr",          "🕒 Pro",
@@ -3512,6 +3676,31 @@ async fn handle_shell_command(
 
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 println!("  [{ts}] ▶ Shell command completed: !{}", cmd_display_owned);
+
+                // Write shell command to group chat shared log
+                if chat_id.0 < 0 {
+                    let now_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+                    append_group_chat_log(chat_id.0, &GroupChatLogEntry {
+                        ts: now_ts.clone(),
+                        bot: shell_bot_username.clone(),
+                        role: "user".to_string(),
+                        from: Some(shell_user_display_name.clone()),
+                        text: format!("!{}", cmd_display_owned),
+                    });
+                    let output_summary = if full_output.trim().is_empty() {
+                        format!("(exit code: {})", exit_code)
+                    } else {
+                        let truncated = truncate_str(full_output.trim(), 2000);
+                        format!("exit code: {}\n{}", exit_code, truncated)
+                    };
+                    append_group_chat_log(chat_id.0, &GroupChatLogEntry {
+                        ts: now_ts,
+                        bot: shell_bot_username.clone(),
+                        role: "assistant".to_string(),
+                        from: None,
+                        text: output_summary,
+                    });
+                }
             }
 
             // Queue processing
@@ -3548,6 +3737,18 @@ async fn handle_shell_command(
 
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] ■ Shell command stopped: !{}", cmd_display_owned);
+
+            // Write stopped shell command to group chat shared log
+            if chat_id.0 < 0 {
+                let now_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+                append_group_chat_log(chat_id.0, &GroupChatLogEntry {
+                    ts: now_ts,
+                    bot: shell_bot_username.clone(),
+                    role: "user".to_string(),
+                    from: Some(shell_user_display_name.clone()),
+                    text: format!("!{} [Stopped]", cmd_display_owned),
+                });
+            }
 
             let mut data = state_owned.lock().await;
             data.cancel_tokens.remove(&chat_id);
@@ -4131,6 +4332,7 @@ async fn handle_text_message(
     chat_id: ChatId,
     user_text: &str,
     state: &SharedState,
+    user_display_name: &str,
 ) -> ResponseResult<()> {
     msg_debug(&format!("[handle_text_message] START chat_id={}, user_text={:?}",
         chat_id.0, truncate_str(user_text, 100)));
@@ -4311,6 +4513,8 @@ async fn handle_text_message(
     let bot_owned = bot.clone();
     let state_owned = state.clone();
     let user_text_owned = user_text.to_string();
+    let bot_username_for_log = bot_username_for_prompt.clone();
+    let user_display_name_owned = user_display_name.to_string();
     let provider_str: &'static str = if model.is_some() {
         if codex::is_codex_model(model.as_deref()) { "codex" } else { "claude" }
     } else if !claude::is_claude_available() && codex::is_codex_available() {
@@ -4332,6 +4536,7 @@ async fn handle_text_message(
         let mut new_session_id: Option<String> = None;
         let mut spin_idx: usize = 0;
         let mut pending_cokacdir = false;
+        let mut suppress_tool_display = false;
         let mut last_tool_name: String = String::new();
 
         let (polling_time_ms, silent_mode) = {
@@ -4374,6 +4579,7 @@ async fn handle_text_message(
                                 }
                                 StreamMessage::ToolUse { name, input } => {
                                     pending_cokacdir = detect_cokacdir_command(&name, &input);
+                                    suppress_tool_display = detect_chat_log_read(&name, &input);
                                     last_tool_name = name.clone();
                                     let summary = format_tool_input(&name, &input);
                                     let ts = chrono::Local::now().format("%H:%M:%S");
@@ -4397,10 +4603,14 @@ async fn handle_text_message(
                                 StreamMessage::ToolResult { content, is_error } => {
                                     if std::mem::take(&mut pending_cokacdir) {
                                         let ts = chrono::Local::now().format("%H:%M:%S");
-                                        println!("  [{ts}]   ↩ cokacdir: {content}");
-                                        let formatted = format_cokacdir_result(&content);
-                                        if !formatted.is_empty() {
-                                            full_response.push_str(&format!("\n{}\n", formatted));
+                                        if std::mem::take(&mut suppress_tool_display) {
+                                            println!("  [{ts}]   ↩ cokacdir (chat_log, suppressed)");
+                                        } else {
+                                            println!("  [{ts}]   ↩ cokacdir: {content}");
+                                            let formatted = format_cokacdir_result(&content);
+                                            if !formatted.is_empty() {
+                                                full_response.push_str(&format!("\n{}\n", formatted));
+                                            }
                                         }
                                     } else if is_error {
                                         let ts = chrono::Local::now().format("%H:%M:%S");
@@ -4563,6 +4773,7 @@ async fn handle_text_message(
 
                 // Update session state
                 {
+                    let final_response_for_log = final_response.clone();
                     let mut data = state_owned.lock().await;
                     if let Some(session) = data.sessions.get_mut(&chat_id) {
                         msg_debug(&format!("[polling] saving session: new_session_id={:?}, old_session_id={:?}, history_len={}",
@@ -4581,6 +4792,24 @@ async fn handle_text_message(
                         save_session_to_file(session, &current_path, provider_str);
                         msg_debug(&format!("[polling] session saved: session_id={:?}, history_len={}",
                             session.session_id, session.history.len()));
+                    }
+                    // Write to group chat shared log (for cross-bot context sharing)
+                    if chat_id.0 < 0 {
+                        let now_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+                        append_group_chat_log(chat_id.0, &GroupChatLogEntry {
+                            ts: now_ts.clone(),
+                            bot: bot_username_for_log.clone(),
+                            role: "user".to_string(),
+                            from: Some(user_display_name_owned.clone()),
+                            text: user_text_owned.clone(),
+                        });
+                        append_group_chat_log(chat_id.0, &GroupChatLogEntry {
+                            ts: now_ts,
+                            bot: bot_username_for_log.clone(),
+                            role: "assistant".to_string(),
+                            from: None,
+                            text: final_response_for_log,
+                        });
                     }
                 }
 
@@ -4673,6 +4902,9 @@ async fn handle_text_message(
                 if let Some(sid) = new_session_id {
                     session.session_id = Some(sid);
                 }
+                // Clone for group chat log before moving into history
+                let user_text_for_log = user_text_owned.clone();
+                let response_for_log = stopped_response.clone();
                 session.history.push(HistoryItem {
                     item_type: HistoryType::User,
                     content: user_text_owned,
@@ -4682,6 +4914,24 @@ async fn handle_text_message(
                     content: stopped_response,
                 });
                 save_session_to_file(session, &current_path, provider_str);
+                // Write to group chat shared log (for cross-bot context sharing)
+                if chat_id.0 < 0 {
+                    let now_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+                    append_group_chat_log(chat_id.0, &GroupChatLogEntry {
+                        ts: now_ts.clone(),
+                        bot: bot_username_for_log.clone(),
+                        role: "user".to_string(),
+                        from: Some(user_display_name_owned.clone()),
+                        text: user_text_for_log,
+                    });
+                    append_group_chat_log(chat_id.0, &GroupChatLogEntry {
+                        ts: now_ts,
+                        bot: bot_username_for_log.clone(),
+                        role: "assistant".to_string(),
+                        from: None,
+                        text: response_for_log,
+                    });
+                }
             }
             data.cancel_tokens.remove(&chat_id);
             data.stop_message_ids.remove(&chat_id);
@@ -5319,6 +5569,14 @@ fn detect_cokacdir_command(name: &str, input: &str) -> bool {
     })
 }
 
+/// Check if a Bash tool call contains --read_chat_log (result should be suppressed from display).
+fn detect_chat_log_read(name: &str, input: &str) -> bool {
+    if name != "Bash" { return false; }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(input) else { return false };
+    let cmd = v.get("command").and_then(|v| v.as_str()).unwrap_or("");
+    cmd.contains("--read_chat_log")
+}
+
 /// Read the most recent .result file from schedule dir and delete it
 fn read_latest_cron_result() -> Option<String> {
     let dir = schedule_dir()?;
@@ -5417,8 +5675,14 @@ fn format_cokacdir_result(content: &str) -> String {
         let schedule = v["schedule"].as_str().unwrap_or("");
         format!("✅ Updated\n🕐 `{}`\n🔖 {}", schedule, id)
     } else if v.get("id").is_some() {
-        // --cron-remove or --message result: not useful to show to user
-        String::new()
+        let id = v["id"].as_str().unwrap_or("?");
+        if id.starts_with("msg_") {
+            // --message result: not useful to show to user
+            String::new()
+        } else {
+            // --cron-remove → {"status":"ok","id":"..."}
+            format!("✅ Removed\n🔖 {}", id)
+        }
     } else {
         content.to_string()
     }
@@ -5927,6 +6191,7 @@ async fn execute_schedule(
         let mut had_error = false;
         let mut spin_idx: usize = 0;
         let mut pending_cokacdir = false;
+        let mut suppress_tool_display = false;
         let mut last_tool_name: String = String::new();
         let mut exec_session_id: Option<String> = None;
 
@@ -5962,6 +6227,7 @@ async fn execute_schedule(
                             }
                             StreamMessage::ToolUse { name, input } => {
                                 pending_cokacdir = detect_cokacdir_command(&name, &input);
+                                suppress_tool_display = detect_chat_log_read(&name, &input);
                                 last_tool_name = name.clone();
                                 let summary = format_tool_input(&name, &input);
                                 let ts = chrono::Local::now().format("%H:%M:%S");
@@ -5985,10 +6251,14 @@ async fn execute_schedule(
                             StreamMessage::ToolResult { content, is_error } => {
                                 if std::mem::take(&mut pending_cokacdir) {
                                     let ts = chrono::Local::now().format("%H:%M:%S");
-                                    println!("  [{ts}]   ↩ [Schedule] cokacdir: {content}");
-                                    let formatted = format_cokacdir_result(&content);
-                                    if !formatted.is_empty() {
-                                        full_response.push_str(&format!("\n{}\n", formatted));
+                                    if std::mem::take(&mut suppress_tool_display) {
+                                        println!("  [{ts}]   ↩ [Schedule] cokacdir (chat_log, suppressed)");
+                                    } else {
+                                        println!("  [{ts}]   ↩ [Schedule] cokacdir: {content}");
+                                        let formatted = format_cokacdir_result(&content);
+                                        if !formatted.is_empty() {
+                                            full_response.push_str(&format!("\n{}\n", formatted));
+                                        }
                                     }
                                 } else if is_error {
                                     let truncated = truncate_str(&content, 500);
@@ -6217,6 +6487,27 @@ async fn execute_schedule(
             }
             let sched_provider = if is_codex_sched { "codex" } else { "claude" };
             save_session_to_file(&sched_session, &workspace_path_owned, sched_provider);
+        }
+
+        // Write to group chat shared log (scheduled task)
+        if chat_id.0 < 0 && !sched_bot_username.is_empty() {
+            let now_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+            append_group_chat_log(chat_id.0, &GroupChatLogEntry {
+                ts: now_ts.clone(),
+                bot: sched_bot_username.clone(),
+                role: "user".to_string(),
+                from: Some("scheduled_task".to_string()),
+                text: entry_clone.prompt.clone(),
+            });
+            if !full_response.is_empty() {
+                append_group_chat_log(chat_id.0, &GroupChatLogEntry {
+                    ts: now_ts,
+                    bot: sched_bot_username.clone(),
+                    role: "assistant".to_string(),
+                    from: None,
+                    text: full_response.clone(),
+                });
+            }
         }
 
         // Update schedule file (last_run / delete if once)
@@ -6456,6 +6747,8 @@ async fn process_bot_message(
     let current_path_owned = current_path.clone();
     let prompt_owned = prompt.clone();
     let bmsg_id_for_log = msg.id.clone();
+    let bot_username_for_log = bot_username.to_string();
+    let from_bot_for_log = msg.from.clone();
     msg_debug(&format!("[process_bot_message] spawning polling loop: provider={}, msg_id={}, placeholder_msg_id={}",
         provider_str, bmsg_id_for_log, placeholder_msg_id));
     tokio::spawn(async move {
@@ -6472,6 +6765,7 @@ async fn process_bot_message(
         let mut new_session_id: Option<String> = None;
         let mut spin_idx: usize = 0;
         let mut pending_cokacdir = false;
+        let mut suppress_tool_display = false;
         let mut last_tool_name: String = String::new();
 
         let (polling_time_ms, silent_mode) = {
@@ -6512,6 +6806,7 @@ async fn process_bot_message(
                                 }
                                 StreamMessage::ToolUse { name, input } => {
                                     pending_cokacdir = detect_cokacdir_command(&name, &input);
+                                    suppress_tool_display = detect_chat_log_read(&name, &input);
                                     last_tool_name = name.clone();
                                     let summary = format_tool_input(&name, &input);
                                     let ts = chrono::Local::now().format("%H:%M:%S");
@@ -6534,11 +6829,16 @@ async fn process_bot_message(
                                         bmsg_id_for_log, is_error, content.len(), pending_cokacdir, last_tool_name));
                                     if std::mem::take(&mut pending_cokacdir) {
                                         let ts = chrono::Local::now().format("%H:%M:%S");
-                                        println!("  [{ts}]   ↩ [BotMsg] cokacdir: {content}");
-                                        let formatted = format_cokacdir_result(&content);
-                                        msg_debug(&format!("[botmsg_poll:{}] cokacdir result formatted_len={}", bmsg_id_for_log, formatted.len()));
-                                        if !formatted.is_empty() {
-                                            full_response.push_str(&format!("\n{}\n", formatted));
+                                        if std::mem::take(&mut suppress_tool_display) {
+                                            println!("  [{ts}]   ↩ [BotMsg] cokacdir (chat_log, suppressed)");
+                                            msg_debug(&format!("[botmsg_poll:{}] chat_log result suppressed", bmsg_id_for_log));
+                                        } else {
+                                            println!("  [{ts}]   ↩ [BotMsg] cokacdir: {content}");
+                                            let formatted = format_cokacdir_result(&content);
+                                            msg_debug(&format!("[botmsg_poll:{}] cokacdir result formatted_len={}", bmsg_id_for_log, formatted.len()));
+                                            if !formatted.is_empty() {
+                                                full_response.push_str(&format!("\n{}\n", formatted));
+                                            }
                                         }
                                     } else if is_error {
                                         msg_debug(&format!("[botmsg_poll:{}] tool error: {}", bmsg_id_for_log, truncate_str(&content, 200)));
@@ -6711,6 +7011,24 @@ async fn process_bot_message(
                     } else {
                         msg_debug(&format!("[botmsg_poll:{}] no session found for chat_id={}, skipping session update", bmsg_id_for_log, chat_id.0));
                     }
+                    // Write to group chat shared log (bot-to-bot messages)
+                    if chat_id.0 < 0 {
+                        let now_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+                        append_group_chat_log(chat_id.0, &GroupChatLogEntry {
+                            ts: now_ts.clone(),
+                            bot: bot_username_for_log.clone(),
+                            role: "user".to_string(),
+                            from: Some(format!("bot:{}", from_bot_for_log)),
+                            text: prompt_owned.clone(),
+                        });
+                        append_group_chat_log(chat_id.0, &GroupChatLogEntry {
+                            ts: now_ts,
+                            bot: bot_username_for_log.clone(),
+                            role: "assistant".to_string(),
+                            from: None,
+                            text: final_response.clone(),
+                        });
+                    }
                 }
 
                 let ts = chrono::Local::now().format("%H:%M:%S");
@@ -6779,6 +7097,8 @@ async fn process_bot_message(
                 if let Some(sid) = new_session_id {
                     session.session_id = Some(sid);
                 }
+                let prompt_for_log = prompt_owned.clone();
+                let response_for_log = stopped_response.clone();
                 session.history.push(HistoryItem {
                     item_type: HistoryType::User,
                     content: prompt_owned,
@@ -6788,6 +7108,24 @@ async fn process_bot_message(
                     content: stopped_response,
                 });
                 save_session_to_file(session, &current_path_owned, provider_str);
+                // Write to group chat shared log (bot-to-bot messages, stopped)
+                if chat_id.0 < 0 {
+                    let now_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+                    append_group_chat_log(chat_id.0, &GroupChatLogEntry {
+                        ts: now_ts.clone(),
+                        bot: bot_username_for_log.clone(),
+                        role: "user".to_string(),
+                        from: Some(format!("bot:{}", from_bot_for_log)),
+                        text: prompt_for_log,
+                    });
+                    append_group_chat_log(chat_id.0, &GroupChatLogEntry {
+                        ts: now_ts,
+                        bot: bot_username_for_log.clone(),
+                        role: "assistant".to_string(),
+                        from: None,
+                        text: response_for_log,
+                    });
+                }
             } else {
                 msg_debug(&format!("[botmsg_poll:{}] cancel: no session found for chat_id={}", bmsg_id_for_log, chat_id.0));
             }

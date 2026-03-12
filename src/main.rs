@@ -80,6 +80,8 @@ fn print_help() {
     println!("                            Update schedule time");
     println!("    --message <TEXT> --to <BOT> --chat <ID> --key <HASH>");
     println!("                            Send message to another bot (internal use)");
+    println!("    --read_chat_log <CHAT_ID> [--range <N|START-END>] [--bot <USERNAME>]");
+    println!("                            Read group chat shared log");
     println!();
     println!("HOMEPAGE: https://cokacdir.cokac.com");
 }
@@ -159,6 +161,48 @@ fn cron_debug(msg: &str) {
 
 fn msg_debug(msg: &str) {
     claude::debug_log_to("msg.log", msg);
+}
+
+fn handle_read_group_chat(chat_id: i64, range_str: Option<&str>, filter_bot: Option<&str>) {
+    use services::telegram;
+
+    // Parse range: either a single number N (last N entries) or "START-END" (1-based line range)
+    enum ReadMode { LastN(usize), Range(usize, Option<usize>) }
+    let mode = match range_str {
+        Some(s) if s.contains('-') => {
+            let parts: Vec<&str> = s.splitn(2, '-').collect();
+            let start: usize = parts[0].parse().unwrap_or(1);
+            let end: usize = parts.get(1).and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+            ReadMode::Range(start, Some(end))
+        }
+        Some(s) => ReadMode::LastN(s.parse().unwrap_or(20)),
+        None => ReadMode::LastN(20),
+    };
+
+    let entries = match mode {
+        ReadMode::LastN(n) => {
+            let all = telegram::read_group_chat_log_range(chat_id, 1, None, filter_bot);
+            let start = all.len().saturating_sub(n);
+            all[start..].to_vec()
+        }
+        ReadMode::Range(start, end) => {
+            telegram::read_group_chat_log_range(chat_id, start, end, filter_bot)
+        }
+    };
+
+    if entries.is_empty() {
+        println!("(no entries found for chat_id {})", chat_id);
+        return;
+    }
+    for (line_num, entry) in &entries {
+        let from_info = entry.from.as_deref().map(|f| format!("({})", f)).unwrap_or_default();
+        let role_display = if entry.role == "user" {
+            format!("user→@{}", entry.bot)
+        } else {
+            format!("@{}", entry.bot)
+        };
+        println!("{:>5} [{}] {}{}: {}", line_num, entry.ts, role_display, from_info, entry.text);
+    }
 }
 
 fn handle_cron_register(prompt: &str, at_value: &str, chat_id: i64, hash_key: &str, once: bool, session_id: Option<&str>) {
@@ -1005,6 +1049,37 @@ fn main() -> io::Result<()> {
                     _ => {
                         msg_debug("[main:--message] incomplete arguments, showing error");
                         eprintln!("{}", serde_json::json!({"status":"error","message":"--message requires <TEXT> --to <BOT> --chat <ID> --key <HASH>"}));
+                    }
+                }
+                return Ok(());
+            }
+            "--read_chat_log" => {
+                // Parse: --read_chat_log <CHAT_ID> [--range <N|START-END>] [--bot <USERNAME>]
+                let mut chat_id: Option<i64> = None;
+                let mut range_str: Option<String> = None;
+                let mut filter_bot: Option<String> = None;
+                let mut j = i + 1;
+                while j < args.len() {
+                    match args[j].as_str() {
+                        "--range" => {
+                            if j + 1 < args.len() { range_str = Some(args[j + 1].clone()); j += 2; }
+                            else { j += 1; }
+                        }
+                        "--bot" => {
+                            if j + 1 < args.len() { filter_bot = Some(args[j + 1].clone()); j += 2; }
+                            else { j += 1; }
+                        }
+                        _ if chat_id.is_none() && !args[j].starts_with("--") => {
+                            chat_id = args[j].parse().ok();
+                            j += 1;
+                        }
+                        _ => { j += 1; }
+                    }
+                }
+                match chat_id {
+                    Some(cid) => handle_read_group_chat(cid, range_str.as_deref(), filter_bot.as_deref()),
+                    None => {
+                        eprintln!("{}", serde_json::json!({"status":"error","message":"--read_chat_log requires <CHAT_ID>"}));
                     }
                 }
                 return Ok(());
