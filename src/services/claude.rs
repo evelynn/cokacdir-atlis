@@ -7,6 +7,13 @@ use std::fs::OpenOptions;
 use regex::Regex;
 use serde_json::Value;
 
+/// Generate a unique ID from timestamp nanoseconds + PID
+fn simple_uuid() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    format!("{:x}_{}", nanos, std::process::id())
+}
+
 /// Global debug flag — toggled by /debug command or COKACDIR_DEBUG=1 env var
 pub static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -229,8 +236,9 @@ pub fn execute_command(
         tools_str,
         "--output-format".to_string(),
         "json".to_string(),
-        "--append-system-prompt".to_string(),
-        r#"You are a terminal file manager assistant. Be concise. Focus on file operations. Respond in the same language as the user.
+    ];
+
+    let default_system_prompt = r#"You are a terminal file manager assistant. Be concise. Focus on file operations. Respond in the same language as the user.
 
 SECURITY RULES (MUST FOLLOW):
 - NEVER execute destructive commands like rm -rf, format, mkfs, dd, etc.
@@ -256,8 +264,29 @@ IMPORTANT: Format your responses using Markdown for better readability:
 - Use numbered lists (1. item) for sequential steps
 - Use code blocks (```language) for multi-line code or command examples
 - Use headers (## Title) to organize longer responses
-- Keep formatting minimal and terminal-friendly"#.to_string(),
-    ];
+- Keep formatting minimal and terminal-friendly"#;
+
+    // Write system prompt to file to avoid OS "Argument list too long" (E2BIG)
+    struct SpFileGuard(Option<std::path::PathBuf>);
+    impl Drop for SpFileGuard {
+        fn drop(&mut self) {
+            if let Some(ref p) = self.0 { let _ = std::fs::remove_file(p); }
+        }
+    }
+    let sp_dir = dirs::home_dir().unwrap_or_else(std::env::temp_dir).join(".cokacdir");
+    let _ = std::fs::create_dir_all(&sp_dir);
+    let sp_path = sp_dir.join(format!("system_prompt_{}", simple_uuid()));
+    if let Err(e) = std::fs::write(&sp_path, default_system_prompt) {
+        return ClaudeResponse {
+            success: false,
+            response: None,
+            session_id: None,
+            error: Some(format!("Failed to write system prompt file: {}", e)),
+        };
+    }
+    args.push("--append-system-prompt-file".to_string());
+    args.push(sp_path.to_string_lossy().to_string());
+    let _sp_guard = SpFileGuard(Some(sp_path));
 
     // Set model if specified
     if let Some(m) = model {
@@ -714,15 +743,32 @@ IMPORTANT: Format your responses using Markdown for better readability:
         "stream-json".to_string(),
     ];
 
-    // Append system prompt based on parameter
+    // Always write system prompt to file and use --append-system-prompt-file
+    // to avoid OS "Argument list too long" (E2BIG) error.
     let effective_prompt = match system_prompt {
         None => Some(default_system_prompt),
         Some("") => None,
         Some(p) => Some(p),
     };
+    struct SpFileGuard(Option<std::path::PathBuf>);
+    impl Drop for SpFileGuard {
+        fn drop(&mut self) {
+            if let Some(ref p) = self.0 { let _ = std::fs::remove_file(p); }
+        }
+    }
+    let mut _sp_guard = SpFileGuard(None);
     if let Some(sp) = effective_prompt {
-        args.push("--append-system-prompt".to_string());
-        args.push(sp.to_string());
+        let sp_dir = dirs::home_dir().unwrap_or_else(std::env::temp_dir).join(".cokacdir");
+        let _ = std::fs::create_dir_all(&sp_dir);
+        let sp_path = sp_dir.join(format!("system_prompt_{}", simple_uuid()));
+        std::fs::write(&sp_path, sp).map_err(|e| {
+            debug_log(&format!("ERROR: Failed to write system prompt file: {}", e));
+            format!("Failed to write system prompt file: {}", e)
+        })?;
+        debug_log(&format!("System prompt written to {:?} ({} bytes)", sp_path, sp.len()));
+        args.push("--append-system-prompt-file".to_string());
+        args.push(sp_path.to_string_lossy().to_string());
+        _sp_guard = SpFileGuard(Some(sp_path));
     }
 
     // Set model if specified
