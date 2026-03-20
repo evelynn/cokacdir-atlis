@@ -27,6 +27,22 @@ use crate::keybindings::PanelAction;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// State for Atlas API key setup within TUI
+pub struct AtlasSetupState {
+    step: u8,            // 0 = entering API key, 1 = entering Agent ID
+    api_key: String,
+    current_input: String,
+}
+
+impl AtlasSetupState {
+    fn new() -> Self {
+        Self { step: 0, api_key: String::new(), current_input: String::new() }
+    }
+    fn prompt_label(&self) -> &str {
+        if self.step == 0 { "API Key" } else { "Agent ID" }
+    }
+}
+
 /// Global binary path, resolved once at startup via `std::env::current_exe()`.
 /// Works on Linux (/proc/self/exe), macOS (_NSGetExecutablePath), Windows (GetModuleFileNameW).
 static BIN_PATH: OnceLock<String> = OnceLock::new();
@@ -38,9 +54,9 @@ fn init_bin_path() {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| {
                 if cfg!(windows) {
-                    "cokacdir.exe".to_string()
+                    "ai-atlas-tui.exe".to_string()
                 } else {
-                    "cokacdir".to_string()
+                    "ai-atlas-tui".to_string()
                 }
             })
     });
@@ -48,14 +64,14 @@ fn init_bin_path() {
 
 /// Get the resolved binary path.
 pub fn bin_path() -> &'static str {
-    BIN_PATH.get().map(|s| s.as_str()).unwrap_or("cokacdir")
+    BIN_PATH.get().map(|s| s.as_str()).unwrap_or("ai-atlas-tui")
 }
 
 fn print_help() {
-    println!("cokacdir {} - Multi-panel terminal file manager", VERSION);
+    println!("ai-atlas-tui {} - Multi-panel terminal file manager with AI Atlas & Claude Code", VERSION);
     println!();
     println!("USAGE:");
-    println!("    cokacdir [OPTIONS] [PATH...]");
+    println!("    ai-atlas-tui [OPTIONS] [PATH...]");
     println!();
     println!("ARGS:");
     println!("    [PATH...]               Open panels at given paths (max 10)");
@@ -64,26 +80,15 @@ fn print_help() {
     println!("    -h, --help              Print help information");
     println!("    -v, --version           Print version information");
     println!("    --prompt <TEXT>         Send prompt to AI and print rendered response");
+    println!("    --atlas-setup           Configure AI Atlas API key and Agent ID");
+    println!("    --atlas-config          Show current AI Atlas configuration");
     println!("    --design                Enable theme hot-reload (for theme development)");
-    println!("    --base64 <TEXT>         Decode base64 and print (internal use)");
-    println!("    --ccserver <TOKEN>...   Start Telegram bot server(s)");
-    println!("    --sendfile <PATH> --chat <ID> --key <HASH>");
-    println!("                            Send file via Telegram bot (internal use, HASH = token hash)");
-    println!("    --currenttime            Print current server time");
-    println!("    --cron <PROMPT> --at <TIME> --chat <ID> --key <HASH> [--once] [--session <SID>]");
-    println!("                            Register a scheduled task");
-    println!("    --cron-list --chat <ID> --key <HASH>");
-    println!("                            List registered schedules");
-    println!("    --cron-remove <SID> --chat <ID> --key <HASH>");
-    println!("                            Remove a schedule");
-    println!("    --cron-update <SID> --at <TIME> --chat <ID> --key <HASH>");
-    println!("                            Update schedule time");
-    println!("    --message <TEXT> --to <BOT> --chat <ID> --key <HASH>");
-    println!("                            Send message to another bot (internal use)");
-    println!("    --read_chat_log <CHAT_ID> [--range <N|START-END>] [--bot <USERNAME>]");
-    println!("                            Read group chat shared log");
     println!();
-    println!("HOMEPAGE: https://cokacdir.cokac.com");
+    println!("AI PROVIDERS:");
+    println!("    Claude Code             Install: npm i -g @anthropic-ai/claude-code");
+    println!("    AI Atlas                Run: ai-atlas-tui --atlas-setup");
+    println!();
+    println!("Based on cokacdir (https://github.com/kstost/cokacdir)");
 }
 
 fn handle_base64(encoded: &str) {
@@ -619,13 +624,13 @@ fn handle_bot_message(content: &str, to: &str, chat_id: i64, hash_key: &str) {
 }
 
 fn print_version() {
-    println!("cokacdir {}", VERSION);
+    println!("ai-atlas-tui {}", VERSION);
 }
 
 fn handle_ccserver(tokens: Vec<String>) {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
-    let title = format!("  cokacdir v{}  |  Telegram Bot Server  ", VERSION);
+    let title = format!("  ai-atlas-tui v{}  |  Telegram Bot Server  ", VERSION);
     let width = title.chars().count();
     println!();
     println!("  ┌{}┐", "─".repeat(width));
@@ -671,28 +676,144 @@ fn handle_ccserver(tokens: Vec<String>) {
     }
 }
 
+fn handle_atlas_setup() {
+    use crate::services::atlas;
+    use std::io::{self, Write};
+
+    println!();
+    println!("  AI Atlas Configuration");
+    println!("  ──────────────────────");
+    println!();
+
+    // Show current config
+    let (cur_key, cur_agent, source) = atlas::get_atlas_config_display();
+    if cur_key != "(not set)" {
+        println!("  Current API Key:  {}", cur_key);
+        println!("  Current Agent ID: {}", cur_agent);
+        println!("  Source: {}", source);
+        println!();
+    }
+
+    // Prompt for API Key
+    print!("  API Key: ");
+    io::stdout().flush().unwrap_or(());
+    let mut api_key = String::new();
+    if io::stdin().read_line(&mut api_key).is_err() {
+        eprintln!("  Error reading input");
+        return;
+    }
+    let api_key = api_key.trim().to_string();
+    if api_key.is_empty() {
+        println!("  Cancelled.");
+        return;
+    }
+
+    // Prompt for Agent ID
+    print!("  Agent ID: ");
+    io::stdout().flush().unwrap_or(());
+    let mut agent_id = String::new();
+    if io::stdin().read_line(&mut agent_id).is_err() {
+        eprintln!("  Error reading input");
+        return;
+    }
+    let agent_id = agent_id.trim().to_string();
+    if agent_id.is_empty() {
+        println!("  Cancelled.");
+        return;
+    }
+
+    // Save
+    match atlas::save_atlas_config(&api_key, &agent_id) {
+        Ok(()) => {
+            let masked = if api_key.len() > 12 {
+                format!("****{}", &api_key[api_key.len()-8..])
+            } else {
+                "****".to_string()
+            };
+            println!();
+            println!("  Saved successfully!");
+            println!("  API Key:  {}", masked);
+            println!("  Agent ID: {}", agent_id);
+            if let Some(home) = dirs::home_dir() {
+                println!("  Location: {}", home.join(".ai-atlas-tui").join("settings.json").display());
+            }
+            println!();
+        }
+        Err(e) => {
+            eprintln!("  Error: {}", e);
+        }
+    }
+}
+
+fn handle_atlas_config() {
+    use crate::services::atlas;
+
+    let (masked_key, agent_id, source) = atlas::get_atlas_config_display();
+
+    println!();
+    println!("  AI Atlas Configuration");
+    println!("  ──────────────────────");
+    println!("  API Key:  {}", masked_key);
+    println!("  Agent ID: {}", agent_id);
+    println!("  Source:   {}", source);
+    println!("  Status:   {}", if atlas::is_atlas_available() { "Available" } else { "Not configured" });
+    println!();
+    println!("  To configure: ai-atlas-tui --atlas-setup");
+    println!();
+}
+
 fn handle_prompt(prompt: &str) {
     use crate::ui::theme::Theme;
+    use crate::services::atlas;
+    use crate::services::claude::StreamMessage;
 
-    // Check if Claude is available
-    if !claude::is_claude_available() {
-        eprintln!("Error: Claude CLI is not available.");
-        eprintln!("Please install Claude CLI: https://claude.ai/cli");
+    // Try AI Atlas first (if configured), fall back to Claude Code
+    let use_atlas = atlas::is_atlas_available();
+    let use_claude = claude::is_claude_available();
+
+    if !use_atlas && !use_claude {
+        eprintln!("Error: No AI provider available.");
+        eprintln!("  - Claude Code: npm i -g @anthropic-ai/claude-code");
+        eprintln!("  - AI Atlas: set ATLAS_API_KEY and ATLAS_AGENT_ID env vars");
         return;
     }
 
-    // Execute Claude command
-    let current_dir = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| ".".to_string());
-    let response = claude::execute_command(prompt, None, &current_dir, None, None);
-
-    if !response.success {
-        eprintln!("Error: {}", response.error.unwrap_or_else(|| "Unknown error".to_string()));
-        return;
-    }
-
-    let content = response.response.unwrap_or_default();
+    let content = if use_atlas {
+        // Use AI Atlas via streaming
+        let (tx, rx) = std::sync::mpsc::channel();
+        let prompt_owned = prompt.to_string();
+        let handle = std::thread::spawn(move || {
+            atlas::execute_command_streaming(
+                &prompt_owned, None, ".", tx, None, None, None, None, false,
+            )
+        });
+        let mut result_text = String::new();
+        loop {
+            match rx.recv() {
+                Ok(StreamMessage::Text { content }) => { result_text = content; }
+                Ok(StreamMessage::Done { .. }) => break,
+                Ok(StreamMessage::Error { message, .. }) => {
+                    eprintln!("Error: {}", message);
+                    return;
+                }
+                Err(_) => break,
+                _ => {}
+            }
+        }
+        let _ = handle.join();
+        result_text
+    } else {
+        // Use Claude Code
+        let current_dir = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+        let response = claude::execute_command(prompt, None, &current_dir, None, None);
+        if !response.success {
+            eprintln!("Error: {}", response.error.unwrap_or_else(|| "Unknown error".to_string()));
+            return;
+        }
+        response.response.unwrap_or_default()
+    };
 
     // Normalize empty lines first
     let normalized = normalize_consecutive_empty_lines(&content);
@@ -772,10 +893,18 @@ fn main() -> io::Result<()> {
                 print_version();
                 return Ok(());
             }
+            "--atlas-setup" => {
+                handle_atlas_setup();
+                return Ok(());
+            }
+            "--atlas-config" => {
+                handle_atlas_config();
+                return Ok(());
+            }
             "--prompt" => {
                 if i + 1 >= args.len() {
                     eprintln!("Error: --prompt requires a text argument");
-                    eprintln!("Usage: cokacdir --prompt \"your question\"");
+                    eprintln!("Usage: ai-atlas-tui --prompt \"your question\"");
                     return Ok(());
                 }
                 handle_prompt(&args[i + 1]);
@@ -795,7 +924,7 @@ fn main() -> io::Result<()> {
                     .collect();
                 if tokens.is_empty() {
                     eprintln!("Error: --ccserver requires at least one token argument");
-                    eprintln!("Usage: cokacdir --ccserver <TOKEN> [TOKEN2] ...");
+                    eprintln!("Usage: ai-atlas-tui --ccserver <TOKEN> [TOKEN2] ...");
                     return Ok(());
                 }
                 handle_ccserver(tokens);
@@ -1214,16 +1343,8 @@ fn main() -> io::Result<()> {
 }
 
 fn print_goodbye_message() {
-    // Check for updates
-    check_for_updates();
-
-    println!("Thank you for using COKACDIR! 🙏");
-    println!();
-    println!("If you found this useful, consider checking out my other content:");
-    println!("  📺 YouTube: https://www.youtube.com/@코드깎는노인");
-    println!("  📚 Classes: https://cokac.com/");
-    println!();
-    println!("Happy coding!");
+    println!("Thank you for using AI Atlas TUI!");
+    println!("Based on cokacdir (https://github.com/kstost/cokacdir)");
 }
 
 fn check_for_updates() {
@@ -1586,6 +1707,13 @@ fn run_app<B: ratatui::backend::Backend>(
                                     }
                                 }
                                 if paste_buf.len() > 1 {
+                                    // Atlas setup 모드에서 paste burst 처리
+                                    if app.atlas_setup_state.is_some() {
+                                        if let Some(ref mut setup) = app.atlas_setup_state {
+                                            setup.current_input.push_str(&paste_buf);
+                                        }
+                                        continue;
+                                    }
                                     // 멀티 문자 paste burst 감지 → paste로 처리
                                     handle_windows_paste(app, &paste_buf);
                                     continue;
@@ -1599,6 +1727,71 @@ fn run_app<B: ratatui::backend::Backend>(
 
             match ev {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    // Handle AI provider selection dialog (3 options)
+                    if let Some(selected) = app.ai_provider_select {
+                        // Atlas setup input mode
+                        if let Some(ref mut setup) = app.atlas_setup_state {
+                            match key.code {
+                                KeyCode::Char(c) => { setup.current_input.push(c); }
+                                KeyCode::Backspace => { setup.current_input.pop(); }
+                                KeyCode::Enter => {
+                                    if setup.step == 0 {
+                                        setup.api_key = setup.current_input.clone();
+                                        setup.current_input.clear();
+                                        setup.step = 1;
+                                    } else {
+                                        let agent_id = setup.current_input.clone();
+                                        let api_key = setup.api_key.clone();
+                                        match crate::services::atlas::save_atlas_config(&api_key, &agent_id) {
+                                            Ok(()) => {
+                                                let masked = if api_key.len() > 12 { format!("****{}", &api_key[api_key.len()-8..]) } else { "****".to_string() };
+                                                app.show_message(&format!("Atlas saved: {} / {}", masked, agent_id));
+                                            }
+                                            Err(e) => { app.show_message(&format!("Error: {}", e)); }
+                                        }
+                                        app.atlas_setup_state = None;
+                                        app.ai_provider_select = None;
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    app.atlas_setup_state = None;
+                                    app.ai_provider_select = None;
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+
+                        let max_idx = 2usize;
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.ai_provider_select = Some(if selected == 0 { max_idx } else { selected - 1 });
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                app.ai_provider_select = Some(if selected == max_idx { 0 } else { selected + 1 });
+                            }
+                            KeyCode::Enter => {
+                                match selected {
+                                    0 => {
+                                        app.open_ai_screen_with_provider(crate::ui::ai_screen::AiProvider::ClaudeCode);
+                                    }
+                                    1 => {
+                                        app.open_ai_screen_with_provider(crate::ui::ai_screen::AiProvider::AiAtlas);
+                                    }
+                                    _ => {
+                                        // Atlas Setup
+                                        app.atlas_setup_state = Some(AtlasSetupState::new());
+                                    }
+                                }
+                            }
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                app.ai_provider_select = None;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     match app.current_screen {
                         Screen::FilePanel => {
                             if handle_panel_input(app, key.code, key.modifiers) {
@@ -1686,6 +1879,13 @@ fn run_app<B: ratatui::backend::Backend>(
                     }
                 }
                 Event::Paste(text) => {
+                    // Atlas setup mode: paste directly into input
+                    if let Some(ref mut setup) = app.atlas_setup_state {
+                        // Clean pasted text (trim whitespace/newlines)
+                        let clean = text.trim().replace('\n', "").replace('\r', "");
+                        setup.current_input.push_str(&clean);
+                        continue;
+                    }
                     match app.current_screen {
                         Screen::AIScreen => {
                             if let Some(ref mut state) = app.ai_state {

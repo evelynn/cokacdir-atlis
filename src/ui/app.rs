@@ -1384,6 +1384,10 @@ pub struct App {
     pub ai_state: Option<crate::ui::ai_screen::AIScreenState>,
     pub ai_panel_index: Option<usize>,  // AI가 표시될 패널 인덱스
     pub ai_previous_panel: Option<usize>,  // AI 화면 띄우기 전 포커스 인덱스
+    /// AI provider selection dialog (0 = Claude Code, 1 = AI Atlas, 2 = Setup)
+    pub ai_provider_select: Option<usize>,
+    /// Atlas setup input state (used in main.rs)
+    pub atlas_setup_state: Option<crate::AtlasSetupState>,
 
     // System info state
     pub system_info_state: crate::ui::system_info::SystemInfoState,
@@ -1512,6 +1516,8 @@ impl App {
             ai_state: None,
             ai_panel_index: None,
             ai_previous_panel: None,
+            ai_provider_select: None,
+            atlas_setup_state: None,
             system_info_state: crate::ui::system_info::SystemInfoState::default(),
             advanced_search_state: crate::ui::advanced_search::AdvancedSearchState::default(),
             image_viewer_state: None,
@@ -1614,6 +1620,8 @@ impl App {
             ai_state: None,
             ai_panel_index: None,
             ai_previous_panel: None,
+            ai_provider_select: None,
+            atlas_setup_state: None,
             system_info_state: crate::ui::system_info::SystemInfoState::default(),
             advanced_search_state: crate::ui::advanced_search::AdvancedSearchState::default(),
             image_viewer_state: None,
@@ -3473,17 +3481,21 @@ impl App {
             self.show_message("AI features are not available for remote panels");
             return;
         }
+        // Show provider selection dialog
+        self.ai_provider_select = Some(0);
+    }
+
+    /// Called after provider selection to actually open AI screen
+    pub fn open_ai_screen_with_provider(&mut self, provider: crate::ui::ai_screen::AiProvider) {
+        self.ai_provider_select = None;
         // 1패널이면 AI용 패널 자동 추가
         if self.panels.len() == 1 {
             let path = self.active_panel().path.clone();
             self.panels.push(PanelState::new(path));
         }
         let current_path = self.active_panel().path.display().to_string();
-        // Try to load the most recent session, fall back to new session
-        // Note: claude availability is checked inside AIScreenState (displays error in UI if unavailable)
         self.ai_state = Some(
-            crate::ui::ai_screen::AIScreenState::load_latest_session(current_path.clone())
-                .unwrap_or_else(|| crate::ui::ai_screen::AIScreenState::new(current_path))
+            crate::ui::ai_screen::AIScreenState::new_with_provider(current_path, provider)
         );
         // 원래 포커스 위치 저장
         self.ai_previous_panel = Some(self.active_panel_index);

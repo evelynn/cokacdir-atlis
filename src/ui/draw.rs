@@ -143,6 +143,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         dialogs::draw_remote_spinner(frame, &spinner.message, area, &theme);
     }
 
+    // Draw AI provider selection dialog or Atlas setup
+    if app.atlas_setup_state.is_some() {
+        draw_atlas_setup_dialog(frame, app, area, &theme);
+    } else if let Some(selected) = app.ai_provider_select {
+        draw_ai_provider_dialog(frame, selected, area, &theme);
+    }
+
     // Update message timer
     if app.message_timer > 0 {
         app.message_timer -= 1;
@@ -150,6 +157,93 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             app.message = None;
         }
     }
+}
+
+/// Draw AI provider selection dialog
+fn draw_ai_provider_dialog(frame: &mut Frame, selected: usize, area: Rect, theme: &Theme) {
+    use ratatui::widgets::{Borders, Clear};
+
+    let atlas_available = crate::services::atlas::is_atlas_available();
+    let atlas_status = if atlas_available { " [OK]" } else { " [Not configured]" };
+
+    let dialog_w = 46u16;
+    let dialog_h = 10u16;
+    let x = area.x + (area.width.saturating_sub(dialog_w)) / 2;
+    let y = area.y + (area.height.saturating_sub(dialog_h)) / 2;
+    let dialog_area = Rect::new(x, y, dialog_w.min(area.width), dialog_h.min(area.height));
+
+    frame.render_widget(Clear, dialog_area);
+
+    let items = [
+        "  Claude Code".to_string(),
+        format!("  AI Atlas{}", atlas_status),
+        "  Atlas Setup (API Key)".to_string(),
+    ];
+    let mut lines = vec![
+        Line::from(Span::styled(" Select AI Provider", Style::default().fg(theme.header.title).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+    ];
+    for (i, item) in items.iter().enumerate() {
+        let marker = if i == selected { "> " } else { "  " };
+        let style = if i == selected {
+            Style::default().fg(theme.header.title).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.palette.fg)
+        };
+        lines.push(Line::from(Span::styled(format!("{}{}", marker, item), style)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(" Enter: Select  Esc: Cancel", Style::default().fg(theme.status_bar.text_dim))));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.dialog.border))
+        .title(" AI ");
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .style(Style::default().bg(theme.dialog.bg));
+    frame.render_widget(paragraph, dialog_area);
+}
+
+/// Draw Atlas setup input dialog
+fn draw_atlas_setup_dialog(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
+    use ratatui::widgets::{Borders, Clear};
+
+    let setup = match app.atlas_setup_state {
+        Some(ref s) => s,
+        None => return,
+    };
+
+    // Dialog width adapts to input length
+    let input_len = setup.current_input.len() as u16;
+    let dialog_w = 60u16.max(input_len + 10).min(area.width.saturating_sub(4));
+    let dialog_h = 9u16;
+    let x = area.x + (area.width.saturating_sub(dialog_w)) / 2;
+    let y = area.y + (area.height.saturating_sub(dialog_h)) / 2;
+    let dialog_area = Rect::new(x, y, dialog_w.min(area.width), dialog_h.min(area.height));
+
+    frame.render_widget(Clear, dialog_area);
+
+    let step_label = if setup.step == 0 { "Step 1/2" } else { "Step 2/2" };
+    let prompt = setup.prompt_label();
+
+    let lines = vec![
+        Line::from(Span::styled(format!(" Atlas Setup ({})", step_label), Style::default().fg(theme.header.title).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+        Line::from(Span::styled(format!(" {}: ", prompt), Style::default().fg(theme.palette.fg))),
+        Line::from(Span::styled(format!(" > {}_", setup.current_input), Style::default().fg(theme.header.title))),
+        Line::from(""),
+        Line::from(Span::styled(" Enter: Confirm  Esc: Cancel", Style::default().fg(theme.status_bar.text_dim))),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.dialog.border))
+        .title(" Atlas Setup ");
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .style(Style::default().bg(theme.dialog.bg));
+    frame.render_widget(paragraph, dialog_area);
 }
 
 fn draw_panels(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {

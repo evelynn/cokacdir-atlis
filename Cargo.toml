@@ -1,12 +1,10 @@
 [package]
-name = "cokacdir"
-version = "0.4.55"
+name = "ai-atlas-tui"
+version = "0.1.0"
 edition = "2021"
-authors = ["cokac <monogatree@gmail.com>"]
-description = "Multi-panel terminal file manager with AI-powered natural language commands"
+authors = ["hansol"]
+description = "Multi-panel terminal file manager with AI Atlas & Claude Code integration"
 license = "MIT"
-repository = "https://github.com/kstost/cokacdir"
-homepage = "https://cokacdir.cokac.com"
 keywords = ["terminal", "cli", "file-manager", "multi-panel", "tui", "ai"]
 categories = ["command-line-utilities", "filesystem"]
 
@@ -40,7 +38,7 @@ russh-keys = "0.46"
 async-trait = "0.1"
 ratatui-image = { version = "2.0", default-features = false, features = ["rustix", "image-defaults", "crossterm"] }
 teloxide = { version = "0.13", default-features = false, features = ["macros", "rustls", "ctrlc_handler"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "stream", "blocking"] }
 fs2 = "0.4"
 
 [target.'cfg(unix)'.dependencies]
@@ -50,7 +48,7 @@ libc = "0.2"
 tempfile = "3"
 
 [[bin]]
-name = "cokacdir"
+name = "ai-atlas-tui"
 path = "src/main.rs"
 
 [profile.release]
